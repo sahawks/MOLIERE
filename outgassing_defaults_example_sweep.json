@@ -1,0 +1,73 @@
+{
+  "tfinal": "200",
+  "N": "201",
+  "rtol": "1e-7",
+  "atol": "1e-8",
+  "dt1": "60",
+  "T0": "25",
+  "Tfinal": "250",
+  "RR": "2",
+  "tEq": "40",
+  "Q": "20",
+  "n_steps": "1",
+  "delta": "1000",
+  "step_time": "10",
+  "base_conc": "0",
+  "hold_time_initial": "60",
+  "hold_time_final": "3000",
+  "m": "2 - Sphere",
+  "R": "200",
+  "mSample": "50",
+  "rhoSample": "1",
+  "Vvessel": "10",
+  "MW_analyte": "18",
+  "K_ref": "150",
+  "EaK": "-35",
+  "D_ref": "1e-7",
+  "EaD": "15",
+  "Tref": "25",
+  "cD": "inf",
+  "F": "inf",
+  "c0free": "5",
+  "num_sources": "2",
+  "sources": [
+    {
+      "c0": "100",
+      "A": "1e8",
+      "Ea": "80"
+    },
+    {
+      "c0": "100",
+      "A": "1e11",
+      "Ea": "90"
+    }
+  ],
+  "sweep_enabled": true,
+  "sweep_param": "D \u2013 Diffusivity @ Tref,c=0 (cm\u00b2/s)",
+  "sweep_start": "1e-8",
+  "sweep_stop": "1e-6",
+  "sweep_n": "5",
+  "sweep_log": true,
+  "sweep_cmap": "viridis",
+  "opt_enabled": false,
+  "opt_n": "1",
+  "opt_target": "Concentration (ppbv)",
+  "opt_method": "Differential Evolution",
+  "opt_maxiter": "200",
+  "opt_rows": [
+    {
+      "param": "T0 \u2013 Initial Temp (\u00b0C)",
+      "min": "",
+      "max": "",
+      "log": true
+    }
+  ],
+  "exp_conc_data": "",
+  "exp_mass_data": "",
+  "conc_interp": false,
+  "conc_interp_n": "100",
+  "conc_interp_method": "linear",
+  "mass_interp": false,
+  "mass_interp_n": "100",
+  "mass_interp_method": "linear"
+}
