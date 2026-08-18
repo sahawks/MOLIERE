@@ -5367,6 +5367,20 @@ class OutgassingGUI:
         if getattr(self, '_busy', False):
             return
         try:
+            # Reconcile the dynamic source rows with the Number of Sources
+            # entry before capturing parameters.  This makes clicking Run
+            # equivalent to pressing Enter or clicking "Update Source Fields"
+            # first, and prevents stale source widgets from remaining active.
+            raw_source_count = self.num_sources.get().strip()
+            try:
+                requested_source_count = int(raw_source_count)
+            except ValueError as exc:
+                raise ValueError('Number of Sources must be an integer.') from exc
+            if not 0 <= requested_source_count <= MAX_UI_SOURCES:
+                raise ValueError(
+                    f'Number of Sources must be between 0 and {MAX_UI_SOURCES}.')
+            if requested_source_count != len(self.source_entries):
+                self.update_source_fields()
             base = self._collect_params()
             plan = self._build_sweep_plan(base) if self.sweep_enabled.get() else None
             experimental = self._snapshot_experimental(report=True)
