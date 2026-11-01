@@ -149,6 +149,20 @@ RESAMPLE_TOOLTIP = (
     "Use this option only to draw a smoother guide through ragged plot data."
 )
 
+ACCURACY_TOOLTIP = (
+    "Re-solve every single run, sweep point and best fit at 10x tighter rtol "
+    "and atol, and report the largest difference between this run's c_gas and "
+    "sample-mass curves (as plotted, exported and fitted) and the tighter "
+    "re-run, as % of each curve's maximum.  That difference estimates the "
+    "error of the results.\n\n"
+    "The mass-balance residual cannot do this: BDF conserves it exactly for "
+    "finite F and for isothermal runs however inaccurate the solution, so a "
+    "small residual proves nothing.\n\n"
+    "The check roughly doubles run time; turn it off for long sweeps."
+)
+# The accuracy check re-solves at rtol and atol divided by this factor.
+ACCURACY_TOL_FACTOR = 10.0
+
 # Selectable units for the headspace gas concentration (plotting / experimental
 # input).  Volumetric mixing ratios (ppbv, ppmv) depend on gas temperature;
 # mass concentrations (µg/m³, mg/m³) do not.  Conversions go through the model's
@@ -182,21 +196,25 @@ EXP_PANEL_FLOOR_WIDTH = 170
 PLOT_CANVAS_HARD_MIN = 420
 
 # ============================================================================
-# Core simulation functions (MOLIERE v13 -- conservative Kirchhoff-flux
+# Core simulation functions (MOLIERE -- conservative Kirchhoff-flux
 # finite-volume scheme; exactly mass-conservative for any cD)
 #
-# v13 changes (identical to notebook v13; the two solvers are verified to agree
-# bit-for-bit on the default, short-pulse, finite-F, small-cD and feed-staircase
-# cases):
+# The solver core matches notebook v14; the GUI adds the feed-tank roll-over
+# and a configurable reference temperature.  Changes since v12:
 #   * Breakpoint-split time integration replaces max_step = tfinal/10.  The
 #     forcing is piecewise smooth but not smooth, and BDF's error estimate is
 #     not valid across a discontinuity -- it can fail optimistically, returning
 #     success = True on a badly wrong trajectory (measured: 647 % too high on a
 #     0.5 min purge pulse, while reporting a 7e-4 % mass-balance error).
+#   * Each segment sees its forcing one-sided at its ends (right limit at the
+#     start, left limit at the end), so no step straddles a jump at an endpoint.
 #   * Net and absolute boundary-flux integrals are carried as ODE states instead
 #     of being recovered by quadrature over the output grid.  This gives an
-#     exact conservation residual and a stable normalization even when large
-#     opposing inflow/outflow nearly cancel.
+#     exact bookkeeping residual and a stable normalization even when large
+#     opposing inflow/outflow nearly cancel.  The residual is NOT an accuracy
+#     measure: BDF conserves any linear invariant exactly, so it stays at
+#     round-off for finite F or isothermal runs however inaccurate the solution.
+#     Accuracy is checked separately by re-running at tighter tolerances.
 #   * Analytical Jacobian added for the finite-F constant-D case; the per-call
 #     COO -> CSC rebuild is replaced by an O(nnz) update.
 # ============================================================================
@@ -242,13 +260,19 @@ def flow_rate_vec(t, tEq, tFlush, Q_val):
 
 def feed_conc_vec(t, n_steps, delta, step_time, base_conc,
                   hold_time_initial, hold_time_final):
-    """Vectorized feed concentration → ppbv array."""
+    """Vectorized feed concentration → ppbv array.
+
+    With zero steps (or zero step amplitude) the feed is constant and no cycle
+    duration is needed, so the hold times may both be zero.
+    """
     t = np.asarray(t, dtype=float)
     scalar = t.ndim == 0
     t = np.atleast_1d(t)
+    result = np.full_like(t, base_conc)
+    if int(n_steps) == 0 or float(delta) == 0.0:
+        return float(result[0]) if scalar else result
     total_time = hold_time_initial + 2 * n_steps * step_time + hold_time_final
     t_cycle = t % total_time
-    result = np.full_like(t, base_conc)
     active = (t_cycle >= hold_time_initial) & (t_cycle < total_time - hold_time_final)
     if np.any(active):
         t_act = t_cycle[active] - hold_time_initial
@@ -513,14 +537,9 @@ def _validate_simulation_inputs(
         raise ValueError("Step Time must be > 0 when Number of Steps is positive.")
     if cfeed_params['hold_time_initial'] < 0 or cfeed_params['hold_time_final'] < 0:
         raise ValueError("Feed hold times must be >= 0.")
-    total_feed_time = (cfeed_params['hold_time_initial']
-                       + 2 * int(ns) * cfeed_params['step_time']
-                       + cfeed_params['hold_time_final'])
-    if total_feed_time <= 0:
-        raise ValueError(
-            "The total feed profile duration (initial hold + 2 x steps x step "
-            "time + final hold) must be > 0."
-        )
+    # A positive step count already forces step_time > 0, so the cycle length
+    # is positive whenever the staircase is active.  A constant feed
+    # (n_steps = 0) needs no cycle, and its hold times may both be zero.
     if cfeed_params.get('feed_tank_volume', 0.0) < 0:
         raise ValueError("Feed Tank Volume must be >= 0.")
     feed_minimum = min(
@@ -750,27 +769,74 @@ def forcing_breakpoints(tfinal, temp_params, flow_params, cfeed_params,
     return b
 
 
+class SolverFailure(RuntimeError):
+    """The implicit integrator could not complete a forcing segment."""
+
+
 def solve_forced_ivp(rhs, tfinal, y0, breaks, rtol, atol,
                      min_out_per_segment=8, method='BDF',
-                     max_solution_elements=MAX_SOLUTION_ELEMENTS, **solver_kw):
+                     max_solution_elements=MAX_SOLUTION_ELEMENTS,
+                     output_times=None, **solver_kw):
     """Integrate 0 -> tfinal one smooth segment at a time.
 
     Returns (t, Y, stats).  `t` is strictly increasing; `Y` has shape
     (n_states, len(t)); `stats` carries nfev/njev/nlu, n_segments and seg_edges
     (the index of each breakpoint in `t`, so a discontinuous integrand can be
     integrated segment by segment rather than straddling a jump).
+
+    `output_times` are added to the solver's own output grid (evaluated from
+    the dense output), so two runs can be compared at identical instants.
     """
     y = np.asarray(y0, dtype=float)
+    extra_times = (None if output_times is None
+                   else np.unique(np.asarray(output_times, dtype=float).ravel()))
     t_out, y_out = [], []
     nfev = njev = nlu = 0
     stored_points = 0
     for a, b in zip(breaks[:-1], breaks[1:]):
         if not (b > a):
             continue
-        res = solve_ivp(rhs, (a, b), y, method=method, rtol=rtol, atol=atol,
-                        dense_output=True, **solver_kw)
+        # solve_ivp evaluates both ends of its closed interval, but the flow
+        # and feed helpers are right-continuous and the temperature helper is
+        # left-continuous, so at a forcing jump one end of the segment sees the
+        # neighbouring regime: the last step used the post-jump flow/feed, and
+        # the first step of a ramp used the pre-ramp dT/dt.  Error control then
+        # had to shrink the step until the jump was hidden -- extra work, larger
+        # errors at loose tolerances, and failure at very tight ones.  Give each
+        # segment the correct one-sided view: right limit at a, left limit at b.
+        a_right = np.nextafter(float(a), float(b))
+        b_left = np.nextafter(float(b), float(a))
+
+        def segment_rhs(t_eval, state, _a=a, _b=b, _ar=a_right, _bl=b_left):
+            if t_eval == _a:
+                t_eval = _ar
+            elif t_eval == _b:
+                t_eval = _bl
+            return rhs(t_eval, state)
+
+        segment_kw = dict(solver_kw)
+        jacobian = segment_kw.get('jac')
+        if callable(jacobian):
+            def segment_jac(t_eval, state, _a=a, _b=b, _ar=a_right, _bl=b_left,
+                            _jac=jacobian):
+                if t_eval == _a:
+                    t_eval = _ar
+                elif t_eval == _b:
+                    t_eval = _bl
+                return _jac(t_eval, state)
+            segment_kw['jac'] = segment_jac
+
+        try:
+            res = solve_ivp(segment_rhs, (a, b), y, method=method, rtol=rtol,
+                            atol=atol, dense_output=True, **segment_kw)
+        except (RuntimeError, ValueError, ArithmeticError) as exc:
+            # SciPy raises rather than returning success = False when its
+            # sparse LU is singular ("Factor is exactly singular"), and a
+            # runaway solve can hand the forcing helpers a NaN time.
+            raise SolverFailure(
+                f"solve_ivp failed on segment [{a:g}, {b:g}] min: {exc}.") from exc
         if not res.success:
-            raise RuntimeError(
+            raise SolverFailure(
                 f"solve_ivp failed on segment [{a:g}, {b:g}] min: {res.message}")
         nfev += res.nfev
         njev += res.njev
@@ -784,6 +850,10 @@ def solve_forced_ivp(rhs, tfinal, y0, breaks, rtol, atol,
             ts = np.unique(np.concatenate(
                 (ts, np.linspace(a, b, min_out_per_segment))))
         ts[0], ts[-1] = a, b
+        if extra_times is not None:
+            inside = extra_times[(extra_times > a) & (extra_times < b)]
+            if inside.size:
+                ts = np.unique(np.concatenate((ts, inside)))
         projected_points = stored_points + int(ts.size)
         if y.size * projected_points > int(max_solution_elements):
             estimated_mb = y.size * projected_points * 8.0 / (1024.0 ** 2)
@@ -945,7 +1015,7 @@ def make_ode_system(N, x, R, cD, beta, dt1, T0, Tfinal, RR, tEq,
     def _feed(t):
         if feed_tank_table is not None:
             return feed_tank_eval(t, *feed_tank_table)
-        if n_steps == 0: return base_conc
+        if n_steps == 0 or delta == 0: return base_conc
         tc = t % total_feed_time
         if tc < hold_time_initial or tc >= total_feed_time - hold_time_final:
             return base_conc
@@ -1210,11 +1280,45 @@ def make_ode_system(N, x, R, cD, beta, dt1, T0, Tfinal, RR, tEq,
 # ============================================================================
 
 
+def mobile_concentration_scale(c0free, cgas_init, src_params, K_T0,
+                               cfeed_params, T0):
+    """Rough upper bound (uM) on the mobile concentration a run can reach.
+
+    The larger of the initial mobile analyte plus everything the sources can
+    release, and equilibrium uptake from the initial headspace or the highest
+    feed level at T0.  Used for actionable solver-failure messages and for
+    default cD fit bounds; it is an estimate, not a model output.
+    """
+    src = np.asarray(src_params, dtype=float).reshape(-1)
+    released = float(c0free) + (float(np.sum(src[0::3])) if src.size else 0.0)
+    n_steps = int(cfeed_params.get('n_steps', 0))
+    feed_peak = (float(cfeed_params.get('base_conc', 0.0))
+                 + max(0.0, n_steps * float(cfeed_params.get('delta', 0.0))))
+    feed_uM = feed_peak * 1e-3 / 22.414 * 273.15 / (float(T0) + 273.15)
+    return max(released, K_T0 * feed_uM, K_T0 * float(cgas_init))
+
+
+def _solver_failure_hint(cD, concentration_scale):
+    """Likely cause of a failed solve, appended to the solver's message."""
+    if np.isfinite(cD) and concentration_scale > 20.0 * cD:
+        ratio = concentration_scale / cD
+        return (f" Concentrations reach about {ratio:.3g} x cD, so D = D0 exp(c/cD) "
+                f"spans roughly {ratio / np.log(10.0):.0f} orders of magnitude; "
+                "increase cD or narrow its fit bounds.")
+    return (" Check the parameters; if they are reasonable, try different "
+            "rtol/atol (very tight tolerances can exceed double precision).")
+
+
 def run_simulation(tfinal, temp_params, flow_params, cfeed_params,
                    m, R, mSample, rhoSample, Vvessel, MW_analyte,
                    src_params, EaK, K_ref, D_ref, EaD, cD, F, c0free, cgas_init, N,
-                   rtol, atol, Tref=50, grid_scheme='uniform', grid_stretch=2.0):
-    """Run the conservative MOLIERE outgassing simulation."""
+                   rtol, atol, Tref=50, grid_scheme='uniform', grid_stretch=2.0,
+                   output_times=None):
+    """Run the conservative MOLIERE outgassing simulation.
+
+    `output_times` (optional) are added to the adaptive output grid so the
+    result can be compared with another run at identical instants.
+    """
     src_params = _as_float_array(src_params, 'src_params')
     _validate_simulation_inputs(
         tfinal, temp_params, flow_params, cfeed_params,
@@ -1292,7 +1396,12 @@ def run_simulation(tfinal, temp_params, flow_params, cfeed_params,
     t_start = time.time()
     try:
         t, Y, solve_stats = solve_forced_ivp(
-            rhs, tfinal, ic, breaks, rtol=rtol, atol=atol, **solver_kw)
+            rhs, tfinal, ic, breaks, rtol=rtol, atol=atol,
+            output_times=output_times, **solver_kw)
+    except SolverFailure as exc:
+        scale = mobile_concentration_scale(
+            c0free, cgas_init, src_params, K_t0, cfeed_params, T0)
+        raise SolverFailure(f"{exc}{_solver_failure_hint(cD, scale)}") from exc
     except RuntimeError:
         raise
     except (ValueError, FloatingPointError, ArithmeticError) as exc:
@@ -1400,6 +1509,34 @@ def run_simulation(tfinal, temp_params, flow_params, cfeed_params,
     }
 
 
+def solution_difference(results, refined):
+    """Largest c_gas and mass-change differences between a run and a re-run.
+
+    `refined` is the same model solved at tighter tolerances with output
+    requested at the base run's times as well as its own (denser) steps.  The
+    base run's curve -- linear between its output points, exactly as it is
+    plotted, exported and interpolated for R² and fitting -- is compared with
+    the refined values at every refined output time, so the result covers the
+    error at the base output points and between them.  Each difference is
+    normalized by the refined run's largest magnitude; because the refined run
+    is far more accurate, the values estimate the base run's relative error.
+    Returns (c_gas_pct, delta_m_pct).
+    """
+    t = np.asarray(results['t'], dtype=float)
+    t_ref = np.asarray(refined['t'], dtype=float)
+    differences = []
+    for key in ('c_gas_uM', 'delta_mass'):
+        reference = np.asarray(refined[key], dtype=float)
+        base_curve = np.interp(t_ref, t, np.asarray(results[key], dtype=float))
+        diff = float(np.max(np.abs(base_curve - reference)))
+        scale = float(np.max(np.abs(reference)))
+        if scale > 0.0:
+            differences.append(100.0 * diff / scale)
+        else:
+            differences.append(0.0 if diff == 0.0 else np.inf)
+    return tuple(differences)
+
+
 class _Tooltip:
     """Minimal hover tooltip (ttk has none built in)."""
 
@@ -1500,8 +1637,6 @@ class OutgassingGUI:
         self.log_file = os.path.join(self.app_dir, 'outgassing_gui.log')
 
         self.source_entries = []
-        self.current_results = None
-        self.all_sweep_results = []
         self.current_run_record = None
         self.sweep_run_records = []
         self._last_experimental_snapshot = None
@@ -1845,6 +1980,14 @@ class OutgassingGUI:
         self.N = self.create_entry(sim, "Grid Points:", "201", r); r += 1
         self.rtol = self.create_entry(sim, "Relative Tolerance:", "1e-7", r); r += 1
         self.atol = self.create_entry(sim, "Absolute Tolerance:", "1e-8", r); r += 1
+        # Tighter-tolerance re-run that estimates the error of the results; the
+        # mass-balance residual cannot (see ACCURACY_TOOLTIP).
+        ttk.Label(sim, text="Accuracy check (re-run at rtol/10):").grid(
+            row=r, column=0, sticky=tk.W, pady=2)
+        self.accuracy_check_var = tk.BooleanVar(value=True)
+        accuracy_chk = ttk.Checkbutton(sim, variable=self.accuracy_check_var)
+        accuracy_chk.grid(row=r, column=1, sticky=tk.E, pady=2); r += 1
+        _Tooltip(accuracy_chk, ACCURACY_TOOLTIP)
         ttk.Label(sim, text="Grid Scheme:").grid(row=r, column=0, sticky=tk.W, pady=2)
         self.grid_scheme = ttk.Combobox(sim, width=14, state="readonly")
         self.grid_scheme['values'] = GRID_SCHEMES
@@ -2092,9 +2235,10 @@ class OutgassingGUI:
         self.opt_mass_weight.config(state='disabled')
 
         ttk.Label(opt, text="Multi-Starts:").grid(row=r, column=0, sticky=tk.W, pady=2)
-        # Number of Nelder-Mead fits to run: start 1 uses the current field
-        # values; additional starts are drawn from a Latin-hypercube sample of
-        # the bounds. The per-start results table reveals fit (non-)uniqueness.
+        # Number of least-squares (trust-region) fits to run: start 1 uses the
+        # current field values; additional starts are drawn from a
+        # Latin-hypercube sample of the bounds. The per-start results table
+        # reveals fit (non-)uniqueness.
         self.opt_nstarts = ttk.Entry(opt, width=8)
         self.opt_nstarts.insert(0, "1")
         self.opt_nstarts.grid(row=r, column=1, sticky=tk.E, pady=2); r += 1
@@ -2448,23 +2592,6 @@ class OutgassingGUI:
         self._cgas_input_unit_last = new_unit
         self._update_derived()
 
-    def _cgas_init_uM(self):
-        """Convert the independently unit-tagged initial gas value to µM."""
-        val = float(self.cgas_init.get())
-        unit = self._cgas_input_unit()
-        T0_K = float(self.T0.get()) + 273.15
-        mw = self._safe_MW()
-        if not np.isfinite(T0_K) or T0_K <= 0:
-            raise ValueError('Initial temperature must be greater than -273.15 °C.')
-        if not np.isfinite(mw) or mw <= 0:
-            raise ValueError('Molecular weight must be a finite value > 0.')
-        out = float(self._conc_to_uM(val, T0_K, unit, mw))
-        if not np.isfinite(out):
-            raise ValueError(
-                'Initial gas concentration could not be converted; check the '
-                'value, input unit, temperature, and molecular weight.')
-        return out
-
     def _temp_K_at(self, times):
         """Absolute temperature (K) along `times`, using the GUI temperature
         profile.  Falls back to a constant T0 (or 25 °C) if the profile inputs
@@ -2698,6 +2825,7 @@ class OutgassingGUI:
             'schema_version': CONFIG_SCHEMA_VERSION,
             'tfinal': self.tfinal.get(), 'N': self.N.get(),
             'rtol': self.rtol.get(), 'atol': self.atol.get(),
+            'accuracy_check': self.accuracy_check_var.get(),
             'grid_scheme': self.grid_scheme.get(),
             'grid_stretch': self.grid_stretch.get(),
             'dt1': self.dt1.get(), 'T0': self.T0.get(),
@@ -2716,7 +2844,9 @@ class OutgassingGUI:
             'Tref': self.Tref.get(), 'cD': self.cD.get(), 'F': self.F.get(),
             'c0free': self.c0free.get(), 'cgas_init': self.cgas_init.get(),
             'cgas_init_unit': self._cgas_input_unit(),
-            'num_sources': self.num_sources.get(),
+            # Derived from the rows, not the entry, so the file is always
+            # self-consistent (an unapplied count would add phantom rows).
+            'num_sources': str(len(self.source_entries)),
             'sources': [
                 {'c0': sw[1].get(), 'A': sw[3].get(), 'Ea': sw[5].get()}
                 for sw in self.source_entries
@@ -2802,7 +2932,7 @@ class OutgassingGUI:
             'mass_interp', 'mass_interp_n', 'mass_interp_method',
             'conc_plot_unit', 'conc_data_unit', 'mass_plot_unit',
             'mass_data_unit', 'cgas_init_unit', 'duplicate_policy',
-            'schema_version', 'sweep_enabled', 'opt_enabled',
+            'schema_version', 'sweep_enabled', 'opt_enabled', 'accuracy_check',
         }
         blank_defaulted = []
         for key in [k for k, v in d.items()
@@ -2877,28 +3007,39 @@ class OutgassingGUI:
             d[key] = str(out)
             return out
 
-        # Schema 1 stored the initial gas concentration in µM (the field was
-        # labelled "Initial gas concentration (µM)").  Schema 2 added a unit
-        # selector whose default is ppbv, so an unmigrated schema-1 file would
-        # have its initial gas silently reinterpreted.  Convert it instead.
+        # Schema-1 files come from two GUI generations that stored the initial
+        # gas concentration differently.  Up to v9 the field was labelled
+        # "Initial gas concentration (µM)" and no plot unit was saved.  v10
+        # entered the value in the selected plot unit (interpreted at T0) and
+        # always saved that unit as 'conc_plot_unit'.  Schema 2 tags the value
+        # with its own unit, so an untagged schema-1 value is migrated: keep a
+        # v10 value in its plot unit, convert a v9-or-older µM value to ppbv.
         if schema_version < 2 and 'cgas_init_unit' not in d:
             try:
-                legacy_uM = float(val('cgas_init', '0'))
+                legacy_value = float(val('cgas_init', '0'))
             except (TypeError, ValueError):
-                legacy_uM = 0.0
-            d['cgas_init_unit'] = 'ppbv'
-            if legacy_uM != 0.0 and np.isfinite(legacy_uM):
-                try:
-                    converted = float(self._conc_from_uM(
-                        legacy_uM, f('T0', '50') + 273.15, 'ppbv',
-                        f('MW_analyte', '18')))
-                    d['cgas_init'] = f'{converted:.10g}'
+                legacy_value = 0.0
+            legacy_plot_unit = d.get('conc_plot_unit')
+            if legacy_plot_unit in CONC_UNITS:
+                d['cgas_init_unit'] = legacy_plot_unit
+                if legacy_value != 0.0:
                     repairs.append(
-                        f'cgas_init {legacy_uM:g} µM converted to '
-                        f'{converted:.6g} ppbv (schema 1 -> 2)')
-                except (ValueError, ZeroDivisionError, FloatingPointError):
-                    repairs.append(
-                        'cgas_init could not be converted from µM; left as-is')
+                        f'cgas_init {legacy_value:g} read as {legacy_plot_unit}, the '
+                        'plot unit it was entered in (v10 file, schema 1 -> 2)')
+            else:
+                d['cgas_init_unit'] = 'ppbv'
+                if legacy_value != 0.0 and np.isfinite(legacy_value):
+                    try:
+                        converted = float(self._conc_from_uM(
+                            legacy_value, f('T0', '50') + 273.15, 'ppbv',
+                            f('MW_analyte', '18')))
+                        d['cgas_init'] = f'{converted:.10g}'
+                        repairs.append(
+                            f'cgas_init {legacy_value:g} µM converted to '
+                            f'{converted:.6g} ppbv (v9-or-older file, schema 1 -> 2)')
+                    except (ValueError, ZeroDivisionError, FloatingPointError):
+                        repairs.append(
+                            'cgas_init could not be converted from µM; left as-is')
 
         n_sources = as_int('num_sources', '1')
         if not 0 <= n_sources <= MAX_UI_SOURCES:
@@ -3018,8 +3159,17 @@ class OutgassingGUI:
                 f'opt_nstarts × opt_maxiter exceeded {MAX_OPT_TOTAL_EVALS:,}; '
                 f'opt_maxiter reduced to {max_evals}')
         for key in ('opt_conc_weight', 'opt_mass_weight'):
-            if f(key, '1.0') <= 0:
-                raise ValueError(f'{key} must be > 0.')
+            try:
+                weight_ok = f(key, '1.0') > 0
+            except ValueError:
+                if opt_on:
+                    raise
+                weight_ok = False
+            if not weight_ok:
+                if opt_on:
+                    raise ValueError(f'{key} must be > 0.')
+                d[key] = '1.0'
+                repairs.append(f'{key} was not a positive number; using 1.0')
         valid_params = {k for k, (attr, _) in self.SWEEP_PARAMS.items()
                         if attr not in self.OPT_EXCLUDED_ATTRS}
         for index, row in enumerate(list(val('opt_rows', []))[:opt_n]):
@@ -3034,20 +3184,30 @@ class OutgassingGUI:
                 repairs.append(f'opt_rows[{index}] parameter {label!r} is not '
                                'available; left unset')
                 row.pop('param', None)
+            problem = None
             try:
                 lo = float(row.get('min', '1e-9'))
                 hi = float(row.get('max', '1e-5'))
-            except (TypeError, ValueError) as exc:
-                raise ValueError(
-                    f'Fit bounds for row {index + 1} must be numbers.') from exc
-            if not (np.isfinite(lo) and np.isfinite(hi) and lo < hi):
-                raise ValueError(
-                    f'Fit bounds for row {index + 1} must be finite with '
-                    'min < max.')
-            if bool(row.get('log', True)) and lo <= 0:
-                raise ValueError(
-                    f'Log-scaled fit bounds for row {index + 1} must be '
-                    'positive.')
+            except (TypeError, ValueError):
+                problem = f'Fit bounds for row {index + 1} must be numbers.'
+            if problem is None and not (np.isfinite(lo) and np.isfinite(hi) and lo < hi):
+                problem = (f'Fit bounds for row {index + 1} must be finite with '
+                           'min < max.')
+            if problem is None and bool(row.get('log', True)) and lo <= 0:
+                problem = (f'Log-scaled fit bounds for row {index + 1} must be '
+                           'positive.')
+            if problem is None:
+                continue
+            if opt_on:
+                raise ValueError(problem)
+            # Optimization is off, so this row must not block the load or save:
+            # restore the parameter's default bounds and report it.
+            attribute = self.SWEEP_PARAMS.get(row.get('param', ''), (None,))[0]
+            spec = (self._parameter_spec(attribute) if attribute
+                    else ParameterSpec(1e-9, 1e-5, True))
+            row.update(min=f'{spec.lower:.10g}', max=f'{spec.upper:.10g}',
+                       log=spec.log_default)
+            repairs.append(f'opt_rows[{index}]: {problem[:-1]}; reset to defaults')
 
         for key in ('time_min', 'time_max'):
             raw = str(val(key, '')).strip()
@@ -3080,6 +3240,7 @@ class OutgassingGUI:
 
         gs = d.get('grid_scheme', 'uniform')
         self.grid_scheme.set(gs if gs in GRID_SCHEMES else 'uniform')
+        self.accuracy_check_var.set(bool(d.get('accuracy_check', True)))
         geom = d.get('m', '2 - Sphere')
         self.m.set(geom if geom in self.m['values'] else '2 - Sphere')
         cgas_unit = d.get('cgas_init_unit', d.get('conc_plot_unit', 'ppbv'))
@@ -3154,6 +3315,7 @@ class OutgassingGUI:
             return False
         target = os.path.abspath(path or self.defaults_file)
         try:
+            self._reconcile_source_rows()
             payload = self._validate_defaults_payload(self._defaults_dict_from_gui())
             payload['schema_version'] = CONFIG_SCHEMA_VERSION
             self._atomic_write_json(target, payload)
@@ -3161,7 +3323,12 @@ class OutgassingGUI:
                 text=f"Saved to {os.path.basename(target)}", foreground='green')
             if path is None:
                 self._update_defaults_label()
-            messagebox.showinfo('Save Parameters', f'Parameters saved to:\n{target}')
+            repairs = list(getattr(self, '_last_payload_repairs', ()))
+            note = ('\n\nAdjusted in the saved file:\n'
+                    + '\n'.join(f'  • {r}' for r in repairs[:12])
+                    if repairs else '')
+            messagebox.showinfo('Save Parameters',
+                                f'Parameters saved to:\n{target}{note}')
             return True
         except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
             self._log_exception('saving parameters', exc)
@@ -3287,6 +3454,24 @@ class OutgassingGUI:
         # for the freshly built rows, once the dependent fields exist.
         if hasattr(self, 'beta_var'):
             self._update_derived()
+
+    def _reconcile_source_rows(self):
+        """Rebuild the source rows if Number of Sources was edited but not applied.
+
+        Every path that reads the source rows (Run Simulation, Run
+        Optimization, Save) calls this first, so a pending count can never run
+        or save stale rows.  Raises ValueError for an invalid count.
+        """
+        raw_source_count = self.num_sources.get().strip()
+        try:
+            requested_source_count = int(raw_source_count)
+        except ValueError as exc:
+            raise ValueError('Number of Sources must be an integer.') from exc
+        if not 0 <= requested_source_count <= MAX_UI_SOURCES:
+            raise ValueError(
+                f'Number of Sources must be between 0 and {MAX_UI_SOURCES}.')
+        if requested_source_count != len(self.source_entries):
+            self.update_source_fields()
 
 
     def _plot_pane_floor(self):
@@ -3698,6 +3883,8 @@ class OutgassingGUI:
             'Grid Stretch': p.get('grid_stretch', 2.0),
             'Relative Tolerance': p['rtol'],
             'Absolute Tolerance': p['atol'],
+            f'Accuracy check (re-run at rtol/{ACCURACY_TOL_FACTOR:g})':
+                bool(p.get('accuracy_check', False)),
             'Time at Initial Temp (min)': p['dt1'],
             'Initial Temp (C)': p['T0'],
             'Final Temp (C)': p['Tfinal'],
@@ -3714,7 +3901,8 @@ class OutgassingGUI:
                 'Periodic staircase; cycle repeats for the full simulation',
             'Feed cycle period (min)': (
                 p['hold_time_initial'] + 2 * p['n_steps'] * p['step_time']
-                + p['hold_time_final']),
+                + p['hold_time_final']
+                if p['n_steps'] > 0 and p['delta'] != 0 else 'constant feed'),
             'Feed Tank Volume (ml)': p['feed_tank_volume'],
             'Feed Tank Flow Interpretation':
                 'Independent continuous carrier flow (not chamber flow schedule)',
@@ -3767,6 +3955,7 @@ class OutgassingGUI:
         feed_volume = float(p['feed_tank_volume'])
         tau_feed = (0.0 if feed_volume <= 0 else
                     (np.inf if Q <= 0 else feed_volume / Q))
+        constant_feed = int(p['n_steps']) <= 0 or float(p['delta']) == 0.0
         feed_cycle = (float(p['hold_time_initial'])
                       + 2 * int(p['n_steps']) * float(p['step_time'])
                       + float(p['hold_time_final']))
@@ -3797,7 +3986,8 @@ class OutgassingGUI:
                 float(p['MW_analyte'])))
         constants = {
             'Feed tank residence time, tau_f (min)': fmt(tau_feed),
-            'Repeating feed-cycle period (min)': fmt(feed_cycle),
+            'Repeating feed-cycle period (min)': (
+                'constant' if constant_feed else fmt(feed_cycle)),
             'Vessel gas residence time, tau_v (min)': fmt(tau_vessel),
             'Headspace volume (ml)': fmt(headspace),
             'Sample volume (ml)': fmt(sample_volume),
@@ -4113,6 +4303,10 @@ class OutgassingGUI:
                                  f"{result.get('mass_balance_scale', np.nan):.12g}\n")
                     handle.write(f"# Mass Balance Error (%): "
                                  f"{result['mass_bal_error']:.12g}\n")
+                    handle.write('# (The mass balance is a bookkeeping check; it does '
+                                 'not measure solver accuracy -- see Accuracy Check.)\n')
+                    for line in self._accuracy_export_lines(result):
+                        handle.write(f'# {line}\n')
                     handle.write(f"# Solve Time (s): {result['solve_time']:.8g}\n")
                     handle.write(f"# Solver Segments: {result.get('n_segments', '')}\n")
                     handle.write(f"# Solver Function Evaluations: {result.get('nfev', '')}\n")
@@ -4152,6 +4346,10 @@ class OutgassingGUI:
                             'mass_balance_scale': result.get(
                                 'mass_balance_scale', np.nan),
                             'mass_balance_error (%)': result['mass_bal_error'],
+                            'accuracy_check_c_gas (%)': result.get(
+                                'accuracy_c_gas_pct', np.nan),
+                            'accuracy_check_delta_m (%)': result.get(
+                                'accuracy_delta_m_pct', np.nan),
                             'solve_time (s)': result['solve_time'],
                             'max_c_gas (ppbv)': float(np.nanmax(result['c_gas_ppbv'])),
                             'final_c_gas (ppbv)': float(result['c_gas_ppbv'][-1]),
@@ -4175,10 +4373,12 @@ class OutgassingGUI:
                     handle.write('\n# PER-RUN DATA:\n')
                     for record in records:
                         result = record.results
+                        accuracy = self._accuracy_export_lines(result)
                         handle.write(
                             f"# --- {record.sweep_attribute} exact="
                             f"{record.sweep_value:.17g}; label={record.label}; "
                             f"residual={result['mass_bal_error']:.6e}%; "
+                            f"{'; '.join(accuracy)}; "
                             f"solve={result['solve_time']:.6g}s ---\n")
                         self._results_to_df(result).to_csv(
                             handle, index=False, lineterminator='\n')
@@ -4277,6 +4477,7 @@ class OutgassingGUI:
             N=integer(self.N, 'Grid Points'),
             rtol=finite(self.rtol, 'Relative tolerance'),
             atol=finite(self.atol, 'Absolute tolerance'),
+            accuracy_check=bool(self.accuracy_check_var.get()),
             grid_scheme=self.grid_scheme.get(),
             grid_stretch=finite(self.grid_stretch, 'Grid stretch'),
             dt1=finite(self.dt1, 'Time at initial temperature'),
@@ -4336,7 +4537,7 @@ class OutgassingGUI:
             p['Tref'], p['grid_scheme'], p['grid_stretch'])
         return p
 
-    def _run_one(self, p):
+    def _run_one(self, p, output_times=None):
         """Run a single simulation from a parameter dict p; return results dict."""
         temp_params = {'dt1': p['dt1'], 'T0': p['T0'],
                        'Tfinal': p['Tfinal'], 'RR': p['RR']}
@@ -4356,8 +4557,71 @@ class OutgassingGUI:
             p['EaD'], p['cD'], p['F'], p['c0free'], p.get('cgas_init', 0.0),
             p['N'], p['rtol'], p['atol'], p.get('Tref', 50),
             grid_scheme=p.get('grid_scheme', 'uniform'),
-            grid_stretch=p.get('grid_stretch', 2.0)
+            grid_stretch=p.get('grid_stretch', 2.0),
+            output_times=output_times,
         )
+
+    def _accuracy_check(self, p, results):
+        """Estimate the error of `results` by re-solving more tightly.
+
+        Re-runs the same parameters at rtol and atol divided by
+        ACCURACY_TOL_FACTOR, with output at the original times, and returns
+        result keys to merge into `results`.  rtol is floored at 100 eps, the
+        smallest value SciPy accepts, so the recorded tolerance is the one
+        actually used.  A failed re-run is reported in the returned keys rather
+        than raised, because the run itself succeeded.  Widget-free, so it is
+        safe on the worker threads.
+        """
+        refined_rtol = max(p['rtol'] / ACCURACY_TOL_FACTOR,
+                           100.0 * np.finfo(float).eps)
+        refined_params = dict(p, rtol=refined_rtol,
+                              atol=p['atol'] / ACCURACY_TOL_FACTOR)
+        check = {'accuracy_rtol': refined_params['rtol'],
+                 'accuracy_atol': refined_params['atol']}
+        try:
+            refined = self._run_one(refined_params, output_times=results['t'])
+        except (RuntimeError, ValueError, ArithmeticError, KeyError) as exc:
+            check['accuracy_error'] = str(exc)
+            return check
+        conc_pct, mass_pct = solution_difference(results, refined)
+        check.update(accuracy_c_gas_pct=conc_pct, accuracy_delta_m_pct=mass_pct)
+        return check
+
+    @staticmethod
+    def _accuracy_pct(results):
+        """Larger of the two accuracy-check differences, or None if unavailable."""
+        values = [results.get(key) for key in
+                  ('accuracy_c_gas_pct', 'accuracy_delta_m_pct')]
+        values = [float(value) for value in values if value is not None]
+        return max(values) if values else None
+
+    @staticmethod
+    def _accuracy_text(results):
+        """Short status-line description of a run's accuracy check."""
+        if results.get('accuracy_error'):
+            return 'Accuracy check failed (tighter re-run did not finish)'
+        if results.get('accuracy_c_gas_pct') is None:
+            return 'Accuracy check off'
+        return (f"Est. error (vs rtol/{ACCURACY_TOL_FACTOR:g} re-run): "
+                f"c_gas {results['accuracy_c_gas_pct']:.1e}%, "
+                f"Δm {results['accuracy_delta_m_pct']:.1e}%")
+
+    @staticmethod
+    def _accuracy_export_lines(results):
+        """Accuracy-check lines for the CSV header (without the '# ')."""
+        if results.get('accuracy_error'):
+            return ['Accuracy Check: failed -- tighter re-run did not '
+                    f"finish ({results['accuracy_error']})"]
+        if results.get('accuracy_c_gas_pct') is None:
+            return ['Accuracy Check: off']
+        return [
+            f"Accuracy Check: re-run at rtol={results['accuracy_rtol']:.6g}, "
+            f"atol={results['accuracy_atol']:.6g}",
+            "Accuracy Check c_gas max difference (% of max c_gas): "
+            f"{results['accuracy_c_gas_pct']:.6g}",
+            "Accuracy Check delta_m max difference (% of max |delta_m|): "
+            f"{results['accuracy_delta_m_pct']:.6g}",
+        ]
 
 
     def _toggle_opt_ui(self):
@@ -4396,9 +4660,33 @@ class OutgassingGUI:
             return
         attribute = self.SWEEP_PARAMS[label][0]
         spec = self._parameter_spec(attribute)
-        self._set_entry_value(row['min_entry'], f'{spec.lower:.10g}')
+        lower = spec.lower
+        if attribute == 'cD':
+            lower = self._default_cD_lower(spec.lower)
+        self._set_entry_value(row['min_entry'], f'{lower:.10g}')
         self._set_entry_value(row['max_entry'], f'{spec.upper:.10g}')
         row['log_var'].set(spec.log_default)
+
+    def _default_cD_lower(self, fallback):
+        """Lower cD fit bound scaled to the run's concentrations.
+
+        D = D0 exp(c/cD) overflows once c/cD exceeds about 700 and the solve
+        fails long before that, so a fixed tiny bound wastes most multi-starts.
+        Bounding c/cD at 20 still spans e^20 (~5e8) in D.  Falls back to the
+        generic bound when the current inputs cannot be read.
+        """
+        try:
+            p = self._collect_params()
+            Rgas = 8.31446261815324e-3
+            K_T0 = p['K_ref'] * np.exp(-p['EaK'] / Rgas * (
+                1.0 / (p['T0'] + 273.15) - 1.0 / (p['Tref'] + 273.15)))
+            scale = mobile_concentration_scale(
+                p['c0free'], p['cgas_init'], p['src_params'], K_T0, p, p['T0'])
+        except (ValueError, TypeError, ArithmeticError, tk.TclError):
+            return fallback
+        if not np.isfinite(scale) or scale <= 0:
+            return fallback
+        return max(fallback, scale / 20.0)
 
     def _build_opt_rows(self):
         """Build fit rows with parameter-specific bounds and transformations."""
@@ -4536,6 +4824,7 @@ class OutgassingGUI:
             target = 'Concentration'
 
         try:
+            self._reconcile_source_rows()
             base = self._collect_params()
         except (ValueError, tk.TclError) as exc:
             messagebox.showerror('Parameter Error', str(exc))
@@ -4646,6 +4935,7 @@ class OutgassingGUI:
         log_flags = [spec.use_log for spec in fit_specs]
         conc_unit = conc_series.unit
         mass_unit = mass_series.unit
+        accuracy_check = bool(base.get('accuracy_check'))
 
         def apply_trial(x_natural):
             return self._apply_opt_params(x_natural, base, fit_specs)
@@ -4733,7 +5023,10 @@ class OutgassingGUI:
             return residual
 
         def uncertainty_diagnostics(ls_result, n_obs, n_params):
-            info = dict(stderr=None, rank=0, condition=np.inf, dof=n_obs - n_params,
+            # rank stays None (unknown) when no least_squares result exists --
+            # e.g. a start stopped at its simulation budget -- so the table does
+            # not mislabel a well-determined fit as rank-deficient.
+            info = dict(stderr=None, rank=None, condition=np.nan, dof=n_obs - n_params,
                         active_mask=None, full_rank=False)
             if ls_result is None or getattr(ls_result, 'jac', None) is None:
                 return info
@@ -4835,7 +5128,9 @@ class OutgassingGUI:
 
                     uncertainty = uncertainty_diagnostics(
                         ls_result, n_resid, n_params)
-                    if uncertainty['rank'] < n_params:
+                    if uncertainty['rank'] is None:
+                        status += '; uncertainty unavailable'
+                    elif uncertainty['rank'] < n_params:
                         status += '; rank-deficient'
                     elif not uncertainty.get('well_conditioned', False):
                         status += '; ill-conditioned'
@@ -4871,6 +5166,17 @@ class OutgassingGUI:
                                 best_result['delta_mass'], mass_unit), mass_t, mass_y)
                             if best_result is not None and has_mass else None)
                     records.append(record)
+                # Estimate the error of the overall best fit only (one
+                # extra simulation); fitted parameters inherit that error.
+                checked = [record for record in records
+                           if record.get('res') is not None and record.get('sse') is not None]
+                if accuracy_check and checked and not self._opt_stop:
+                    best_record = min(checked, key=lambda record: record['sse'])
+                    self._opt_status = (
+                        'Checking best-fit accuracy at tighter tolerances...',
+                        'orange')
+                    best_record['res'].update(self._accuracy_check(
+                        apply_trial(best_record['x_nat']), best_record['res']))
                 self._opt_outcome = dict(
                     records=records, terminated_early=bool(self._opt_stop),
                     n_starts=n_starts, failures=dict(self._opt_fail_counts))
@@ -4958,8 +5264,6 @@ class OutgassingGUI:
             'optimization', 'Best Fit', best_params, result_best,
             context['experimental'], context['started_at'])
         self.sweep_run_records = []
-        self.current_results = self.current_run_record.results
-        self.all_sweep_results = []
         self._last_result_mode = 'optimization'
         self._last_experimental_snapshot = context['experimental']
         # Preserve the multi-start comparison on screen, but exports use the
@@ -4976,12 +5280,20 @@ class OutgassingGUI:
             f'{count}x {kind}' for kind, count in sorted(failures.items()))
             if failures else '')
         terminated = bool(outcome.get('terminated_early'))
+        status_color = 'blue' if terminated else 'green'
+        accuracy_text = ''
+        if (self._accuracy_pct(result_best) is not None
+                or result_best.get('accuracy_error')):
+            advisory, advisory_color = self._quality_advisory(result_best)
+            accuracy_text = f" | best fit: {self._accuracy_text(result_best)}{advisory}"
+            if advisory_color and not terminated:
+                status_color = advisory_color
         self.status_label.config(
             text=(f"{'Terminated' if terminated else 'Complete'} — best "
                   f"balanced SSE={best['sse']:.4g} (start {best['start']}) | "
                   f"{len(valid)}/{outcome.get('n_starts', len(records))} starts | "
-                  f"simulations={self._opt_iter}{failure_text}"),
-            foreground='blue' if terminated else 'green')
+                  f"simulations={self._opt_iter}{failure_text}{accuracy_text}"),
+            foreground=status_color)
         if self._opt_error is not None:
             messagebox.showerror('Optimization Error',
                                  f'Stopped early due to an error:\n{self._opt_error}')
@@ -5036,8 +5348,9 @@ class OutgassingGUI:
 
         def values(record):
             uncertainty = record.get('uncertainty') or {}
+            rank = uncertainty.get('rank')
             row = [record['start'], record['status'], record['evals'],
-                   fmt(record.get('sse')), uncertainty.get('rank', 0),
+                   fmt(record.get('sse')), '—' if rank is None else rank,
                    fmt(uncertainty.get('condition'))]
             if show_r2c:
                 row.append(fmt(record.get('r2_conc'), r2=True))
@@ -5091,7 +5404,8 @@ class OutgassingGUI:
             footer,
             text=('Uncertainties are local linearized standard errors. They are '
                   'suppressed when rank-deficient, ill-conditioned, bound-active, '
-                  'or supported by insufficient degrees of freedom.'),
+                  'or supported by insufficient degrees of freedom, and are '
+                  'unavailable when a start stops at its simulation budget.'),
             foreground='gray').pack(side=tk.LEFT)
 
         def copy_table():
@@ -5143,27 +5457,44 @@ class OutgassingGUI:
 
     MB_WARN_PCT = 1e-3
     MB_BAD_PCT = 1e-1
+    ACCURACY_WARN_PCT = 0.1
+    ACCURACY_BAD_PCT = 1.0
 
-    def _mb_advisory(self, results):
-        """Post-run conservation-residual quality note.
+    def _quality_advisory(self, results):
+        """Post-run quality notes from the accuracy check and the residual.
 
-        The residual is the difference between what left through the purge and
-        what the inventory says should have left.  With the conservative
-        (Kirchhoff-flux) scheme it reflects ODE-solver accuracy, so an elevated
-        value points at the tolerances rather than the grid or cD.
+        The accuracy check (a re-run at tighter tolerances) is the error
+        estimate.  The mass-balance residual compares what left through the
+        purge with the inventory change; BDF conserves any linear invariant
+        exactly, so the residual stays at round-off for finite F or isothermal
+        runs however inaccurate the solution, and can only rise through the
+        K(T) weighting of the F = inf surface reservoir during temperature
+        ramps.  A high residual still means the tolerances are too loose, but a
+        low one proves nothing about accuracy.
         Returns (status_suffix, status_color_or_None).
         """
         notes = []
         color = None
+        accuracy = self._accuracy_pct(results)
+        if results.get('accuracy_error'):
+            notes.append('accuracy check failed: ' + str(results['accuracy_error'])[:120])
+            color = '#b36b00'
+        elif accuracy is not None:
+            if not np.isfinite(accuracy) or accuracy > self.ACCURACY_BAD_PCT:
+                notes.append(f"estimated error ~{accuracy:.2g}% — tighten rtol & atol")
+                color = 'red'
+            elif accuracy > self.ACCURACY_WARN_PCT:
+                notes.append(f"estimated error ~{accuracy:.2g}% — consider tighter rtol/atol")
+                color = '#b36b00'
         mb = abs(results.get('mass_bal_error', 0.0))
         if not np.isfinite(mb) or mb > self.MB_BAD_PCT:
-            notes.append(f"conservation residual INVALID ({mb:.2g}%) — "
+            notes.append(f"mass-balance residual INVALID ({mb:.2g}%) — "
                          "check parameters / tighten rtol & atol")
             color = 'red'
         elif mb > self.MB_WARN_PCT:
-            notes.append(f"conservation residual {mb:.2g}% high — "
+            notes.append(f"mass-balance residual {mb:.2g}% high — "
                          "tighten solver tolerances (rtol/atol)")
-            color = '#b36b00'
+            color = color or '#b36b00'
         suffix = ("  [" + "; ".join(notes) + "]") if notes else ""
         return suffix, color
 
@@ -5367,20 +5698,9 @@ class OutgassingGUI:
         if getattr(self, '_busy', False):
             return
         try:
-            # Reconcile the dynamic source rows with the Number of Sources
-            # entry before capturing parameters.  This makes clicking Run
-            # equivalent to pressing Enter or clicking "Update Source Fields"
-            # first, and prevents stale source widgets from remaining active.
-            raw_source_count = self.num_sources.get().strip()
-            try:
-                requested_source_count = int(raw_source_count)
-            except ValueError as exc:
-                raise ValueError('Number of Sources must be an integer.') from exc
-            if not 0 <= requested_source_count <= MAX_UI_SOURCES:
-                raise ValueError(
-                    f'Number of Sources must be between 0 and {MAX_UI_SOURCES}.')
-            if requested_source_count != len(self.source_entries):
-                self.update_source_fields()
+            # Apply a typed-but-unapplied Number of Sources first, so clicking
+            # Run is equivalent to pressing Enter or "Update Source Fields".
+            self._reconcile_source_rows()
             base = self._collect_params()
             plan = self._build_sweep_plan(base) if self.sweep_enabled.get() else None
             experimental = self._snapshot_experimental(report=True)
@@ -5410,6 +5730,10 @@ class OutgassingGUI:
         try:
             if plan is None:
                 results = self._run_one(base)
+                if base.get('accuracy_check'):
+                    self._sim_status = (
+                        'Checking accuracy at tighter tolerances...', 'orange')
+                    results.update(self._accuracy_check(base, results))
                 record = self._make_run_record(
                     'single', 'Model', base, results, experimental, started_at)
                 outcome = dict(kind='single', record=record)
@@ -5436,6 +5760,11 @@ class OutgassingGUI:
                             f'Sweep {index + 1}/{n_points}: {label} FAILED '
                             f'({str(exc)[:60]})', '#b36b00')
                         continue
+                    if base.get('accuracy_check'):
+                        self._sim_status = (
+                            f"Sweep {index + 1}/{n_points}: {plan['attr']} = {label} "
+                            '(accuracy check)', 'orange')
+                        results.update(self._accuracy_check(params, results))
                     results['_sweep_color'] = tuple(plan['colors'][index])
                     record = self._make_run_record(
                         'sweep', label, params, results, experimental, started_at,
@@ -5444,7 +5773,7 @@ class OutgassingGUI:
                     records.append(record)
                     self._sim_status = (
                         f"Sweep {index + 1}/{n_points}: {plan['attr']} = {label} done | "
-                        f"residual {results['mass_bal_error']:.1e}%", 'orange')
+                        f"{self._accuracy_text(results)}", 'orange')
                 outcome = dict(
                     kind='sweep', records=records, plan=plan, failures=failures,
                     elapsed=time.time() - wall_start, stopped=bool(self._sim_stop))
@@ -5488,8 +5817,6 @@ class OutgassingGUI:
             experimental = record.experimental
             self.current_run_record = record
             self.sweep_run_records = []
-            self.current_results = results
-            self.all_sweep_results = []
             self._last_result_mode = 'single'
             self._last_experimental_snapshot = experimental
             self.update_plots(
@@ -5512,11 +5839,12 @@ class OutgassingGUI:
             if r2_mass is not None:
                 r2_parts.append(f'R²(mass)={r2_mass:.6f}')
             r2_text = (' | ' + ' | '.join(r2_parts)) if r2_parts else ''
-            advisory, advisory_color = self._mb_advisory(results)
+            advisory, advisory_color = self._quality_advisory(results)
             self.status_label.config(
                 text=(f"Complete! Solve time: {results['solve_time']:.2f}s "
                       f"({results.get('n_segments', 1)} segments) | "
-                      f"Conservation residual: {results['mass_bal_error']:.2e}%"
+                      f"{self._accuracy_text(results)} | "
+                      f"Mass-balance residual: {results['mass_bal_error']:.2e}%"
                       f'{r2_text}{advisory}'),
                 foreground=advisory_color or 'green')
             return
@@ -5535,8 +5863,6 @@ class OutgassingGUI:
         labeled = self._labeled_from_records(records)
         self.sweep_run_records = records
         self.current_run_record = records[-1]
-        self.current_results = records[-1].results
-        self.all_sweep_results = labeled
         self._last_result_mode = 'sweep'
         self._last_experimental_snapshot = records[0].experimental
         self.update_plots(
@@ -5551,7 +5877,7 @@ class OutgassingGUI:
                        if np.any(finite) else 0)
         worst = residuals[worst_index]
         residual_text = (
-            f" | max |residual|: {worst:.2e}% "
+            f" | max mass-balance residual: {worst:.2e}% "
             f"({plan.get('attr')} = {records[worst_index].label})")
         if not np.isfinite(worst) or worst > self.MB_BAD_PCT:
             residual_text += ' — INVALID; check parameters / tighten tolerances'
@@ -5562,12 +5888,39 @@ class OutgassingGUI:
         else:
             status_color = 'green'
 
+        # Accuracy-check summary: the worst estimated error over the
+        # points that were checked, plus any points whose re-run failed.
+        checked = [(self._accuracy_pct(record.results), record)
+                   for record in records
+                   if self._accuracy_pct(record.results) is not None]
+        accuracy_text = ''
+        accuracy_color = 'green'
+        if checked:
+            worst_accuracy, worst_record = max(checked, key=lambda item: item[0])
+            accuracy_text = (f" | max est. error: {worst_accuracy:.2e}% "
+                             f"({plan.get('attr')} = {worst_record.label})")
+            if not np.isfinite(worst_accuracy) or worst_accuracy > self.ACCURACY_BAD_PCT:
+                accuracy_text += ' — tighten rtol & atol'
+                accuracy_color = 'red'
+            elif worst_accuracy > self.ACCURACY_WARN_PCT:
+                accuracy_text += ' — consider tighter rtol/atol'
+                accuracy_color = '#b36b00'
+        check_failures = sum(
+            1 for record in records if record.results.get('accuracy_error'))
+        if check_failures:
+            accuracy_text += f' | accuracy check failed for {check_failures} point(s)'
+            if accuracy_color == 'green':
+                accuracy_color = '#b36b00'
+        severity = {'green': 0, '#b36b00': 1, 'red': 2}
+        status_color = max(status_color, accuracy_color, key=severity.get)
+
         requested = len(plan.get('vals', records))
         heading = 'Sweep stopped' if outcome.get('stopped') else 'Sweep complete!'
         failed_text = f' | {len(failures)} failed' if failures else ''
         self.status_label.config(
             text=(f'{heading} {len(records)}/{requested} runs in '
-                  f"{outcome.get('elapsed', 0.0):.1f}s{failed_text}{residual_text}"),
+                  f"{outcome.get('elapsed', 0.0):.1f}s{failed_text}"
+                  f"{accuracy_text}{residual_text}"),
             foreground=('#b36b00' if failures and status_color == 'green'
                         else status_color))
         if failures:
