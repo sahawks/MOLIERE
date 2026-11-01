@@ -37,7 +37,10 @@ from scipy.stats import qmc
 LLNL_RELEASE_ID = "LLNL-CODE-2017385"
 APP_TITLE = "Outgassing Model Simulator"
 APP_VERSION = "12.0"
-CONFIG_SCHEMA_VERSION = 2
+# Parameter-file schema numbers are shared with the 13.x development GUI so a
+# number never means two different things: 3 added that GUI's hollow
+# structures, 4 adds the carrier-flow basis (flow_basis, flow_T_std).
+CONFIG_SCHEMA_VERSION = 4
 MAX_UI_SOURCES = 20
 MAX_GRID_POINTS = 10000
 MAX_SWEEP_POINTS = 200
@@ -163,6 +166,40 @@ ACCURACY_TOOLTIP = (
 # The accuracy check re-solves at rtol and atol divided by this factor.
 ACCURACY_TOL_FACTOR = 10.0
 
+# Carrier-flow basis: what the Flow Rate number means.  'actual' is the
+# volumetric flow at the chamber's current temperature (the original model).
+# 'standard' is a mass-flow-controller setpoint in sccm referenced to T_std:
+# the molar carrier flow is fixed, so the flow through the chamber is
+# Q*T/T_std.  Both assume the chamber is at 1 atm.
+FLOW_BASES = ('actual', 'standard')
+FLOW_BASIS_LABELS = {'actual': 'Actual @ chamber T',
+                     'standard': 'Standard (sccm)'}
+FLOW_BASIS_NOTES = {
+    'actual': (
+        "Q is the actual flow at the chamber's current temperature. When the "
+        "chamber heats, fewer moles of carrier pass per minute. If Q was set "
+        "or measured at room temperature, purge is underestimated (about "
+        "30\u00a0% at 150\u00a0°C, 43\u00a0% at 250\u00a0°C)."),
+    'standard': (
+        "Q is a standard flow (sccm) from a mass-flow controller outside the "
+        "chamber. Moles of carrier per minute stay fixed, so the flow through "
+        "the chamber rises as it heats: Q·T/T_std. Gas pushed out by thermal "
+        "expansion during ramps is included."),
+}
+FLOW_BASIS_TOOLTIP = (
+    "Actual @ chamber T: the Flow Rate is the volumetric flow at the chamber "
+    "temperature, so the molar carrier flow falls as 1/T on heating.  Use it "
+    "for a flow measured at chamber conditions, or to reproduce results from "
+    "earlier versions.\n\n"
+    "Standard (sccm): the Flow Rate is a mass-flow-controller setpoint "
+    "referenced to T_std and 1 atm (makers use 0, 20, 21.1 or 25 °C).  The "
+    "chamber flow is Q·T/T_std, and while the flow is on, heating expels "
+    "headspace gas at the fractional rate (dT/dt)/T (cooling draws it back).  "
+    "During the zero-flow period the vessel is treated as sealed.  The feed "
+    "tank's time constant uses the setpoint as entered, V_feed/Q.\n\n"
+    "Both bases assume the chamber is at 1 atm."
+)
+
 # Selectable units for the headspace gas concentration (plotting / experimental
 # input).  Volumetric mixing ratios (ppbv, ppmv) depend on gas temperature;
 # mass concentrations (µg/m³, mg/m³) do not.  Conversions go through the model's
@@ -258,6 +295,21 @@ def flow_rate_vec(t, tEq, tFlush, Q_val):
     return float(Q[0]) if scalar else Q
 
 
+def chamber_flow_vec(t, T_K, flow_params):
+    """Actual flow through the chamber (ml/min at chamber T, 1 atm).
+
+    For the 'standard' basis the entered flow is a molar (sccm) setpoint
+    referenced to T_std, so the chamber flow is Q*T/T_std; for 'actual' it is
+    the entered flow itself.
+    """
+    Q = flow_rate_vec(t, flow_params['tEq'], flow_params['tFlush'],
+                      flow_params['Q'])
+    if flow_params.get('basis', 'actual') == 'standard':
+        Q = Q * np.asarray(T_K, dtype=float) / (
+            float(flow_params.get('T_std', 0.0)) + 273.15)
+    return Q
+
+
 def feed_conc_vec(t, n_steps, delta, step_time, base_conc,
                   hold_time_initial, hold_time_final):
     """Vectorized feed concentration → ppbv array.
@@ -295,7 +347,9 @@ def feed_tank_segments(tfinal, Q_val, V_feed, n_steps, delta, step_time,
     The feed tank intentionally uses its own continuously operating carrier
     flow ``Q_val``.  It is therefore independent of the chamber's on/off flow
     schedule.  A finite volume smooths the ideal staircase with
-    ``tau = V_feed / Q_val``.
+    ``tau = V_feed / Q_val``.  For the standard (sccm) flow basis ``Q_val`` is
+    the setpoint as entered, i.e. the tank is taken at the sccm reference
+    temperature.
     """
     if V_feed <= 0 or Q_val <= 0 or n_steps <= 0 or delta == 0:
         return None
@@ -516,6 +570,15 @@ def _validate_simulation_inputs(
         raise ValueError("D_ref must be > 0.")
     if flow_params['Q'] < 0:
         raise ValueError("Flow rate Q must be >= 0.")
+    flow_basis = flow_params.get('basis', 'actual')
+    if flow_basis not in FLOW_BASES:
+        raise ValueError(
+            f"Flow basis must be one of {', '.join(FLOW_BASES)} (got {flow_basis!r}).")
+    if flow_basis == 'standard':
+        T_std = float(flow_params.get('T_std', 0.0))
+        if not np.isfinite(T_std) or T_std <= -273.15:
+            raise ValueError(
+                "sccm reference temperature must be finite and greater than -273.15 °C.")
     if flow_params['tEq'] < 0 or flow_params['tFlush'] < 0:
         raise ValueError("Flow timing parameters must be >= 0.")
     if flow_params['tEq'] + flow_params['tFlush'] <= 0:
@@ -905,12 +968,20 @@ def solve_forced_ivp(rhs, tfinal, y0, breaks, rtol, atol,
 #         [gam*V_{N-1} + Vhs/K] dc_R/dt = gam*Fl_{N-3/2}
 #                                         - Q (c_R/K - c_feed)
 #                                         + c_R (Vhs/K) (1/K)(dK/dt)
+#                                         - c_R (Vhs/K) (1/T)(dT/dt)*
 #                                         + gam*V_{N-1} * src_total,
 #     which conserves (solid + headspace) mass exactly, including the dK/dt
 #     repartitioning during temperature ramps.
 #   * finite F : the Robin flux  q_R = F (c_R - K c_gas)  is applied at the
 #     outer face of the surface cell, and the identical flux feeds the
 #     headspace ODE, Eqn (5) -- exact solid/gas mass exchange by construction.
+#
+# Carrier-flow basis.  Q is the actual flow through the chamber at T(t).  For
+# the 'actual' basis it is the entered value; for the 'standard' (sccm) basis
+# Q = Q_set*T/T_std, and the term marked * (and its finite-F counterpart
+# -c_gas (1/T)(dT/dt)) removes the headspace gas expelled by thermal expansion
+# of the open vessel while the flow is on.  Both enter the purge integral, so
+# the mass-balance residual stays at round-off.
 
 
 def fv_geometry(x, m_geom):
@@ -939,12 +1010,15 @@ def make_ode_system(N, x, R, cD, beta, dt1, T0, Tfinal, RR, tEq,
                                  tFlush, Q_val, n_steps, delta, step_time,
                                  base_conc, hold_time_initial, hold_time_final,
                                  src_params, Vheadspace, F, Rgas, D0, EaD, K0,
-                                 EaK, m_geom, feed_tank_table=None):
+                                 EaK, m_geom, feed_tank_table=None,
+                                 flow_basis='actual', T_std=0.0):
     """Build the specialized ODE right-hand side; returns (rhs_func, solver_kwargs).
 
     An analytical sparse Jacobian is supplied for the most common case
     (F = inf, cD = inf); concentration-dependent cases use the numerical
-    Jacobian with the conservative sparsity pattern.
+    Jacobian with the conservative sparsity pattern.  ``flow_basis`` says
+    whether ``Q_val`` is the actual chamber flow or a standard (sccm) flow
+    referenced to ``T_std`` (°C); see the note above :func:`fv_geometry`.
     """
     num_srcs = len(src_params) // 3
     is_inf_F = np.isposinf(F)
@@ -981,6 +1055,8 @@ def make_ode_system(N, x, R, cD, beta, dt1, T0, Tfinal, RR, tEq,
         RR_eff = np.sign(delta_T) * abs(RR)
         t_ramp_end = dt1 + abs(delta_T) / abs(RR)
     period = tEq + tFlush
+    standard_flow = flow_basis == 'standard'
+    inv_T_std = 1.0 / (T_std + 273.15)
     total_feed_time = hold_time_initial + 2 * n_steps * step_time + hold_time_final
     inv_cD = 0.0 if is_inf_cD else 1.0 / cD
 
@@ -992,8 +1068,9 @@ def make_ode_system(N, x, R, cD, beta, dt1, T0, Tfinal, RR, tEq,
         src_Ea = np.empty(0)
 
     # Two diagnostic states carry the net and absolute purge integrals:
-    #   dq_net/dt = Q(t) * (c_gas - c_feed) / vSample
+    #   dq_net/dt = [Q(t) * (c_gas - c_feed) + Vhs * c_gas * (dT/dt)/T*] / vSample
     #   dq_abs/dt = abs(dq_net/dt)
+    # (* thermal-expansion outflow, standard flow basis only.)
     # The absolute integral stabilizes the relative conservation metric when
     # substantial inflow and outflow nearly cancel over the full experiment.
     q_idx = (N + num_srcs) if is_inf_F else (N + 1 + num_srcs)
@@ -1009,8 +1086,17 @@ def make_ode_system(N, x, R, cD, beta, dt1, T0, Tfinal, RR, tEq,
             return T0 + RR_eff * (t - dt1), RR_eff
         return Tfinal, 0.0
 
-    def _flow(t):
-        return 0.0 if (t % period) < tEq else Q_val
+    def _flow(t, T, inv_T, dTdt_val):
+        """Chamber flow Q (ml/min at T) and expansion rate (dT/dt)/T (1/min).
+
+        The expansion outflow applies only while the carrier flows; during
+        the zero-flow period the vessel is treated as sealed.
+        """
+        if Q_val <= 0 or (t % period) < tEq:
+            return 0.0, 0.0
+        if standard_flow:
+            return Q_val * T * inv_T_std, dTdt_val * inv_T
+        return Q_val, 0.0
 
     def _feed(t):
         if feed_tank_table is not None:
@@ -1040,7 +1126,7 @@ def make_ode_system(N, x, R, cD, beta, dt1, T0, Tfinal, RR, tEq,
             TC, dTdt_val = _temp(t)
             T = TC + 273.15
             inv_T = 1.0 / T
-            Q = _flow(t)
+            Q, expn = _flow(t, T, inv_T, dTdt_val)
             cfeed = _feed(t) * 0.001 / 22.414 * 273.15 * inv_T
 
             K = K0 * np.exp(EaK_Rgas * inv_T)
@@ -1062,12 +1148,13 @@ def make_ode_system(N, x, R, cD, beta, dt1, T0, Tfinal, RR, tEq,
             VhK = Vheadspace / K
             dcdt[N - 1] = (gam * Fl[-1]
                            - Q * (cs[-1] / K - cfeed)
-                           + cs[-1] * VhK * dKdT_K
+                           + cs[-1] * VhK * (dKdT_K - expn)
                            + gamV_last * src_total) / (gamV_last + VhK)
 
             if num_srcs > 0:
                 dcdt[src_off:src_off + num_srcs] = -rates
-            boundary_rate = Q * (cs[-1] / K - cfeed) * inv_vSample
+            boundary_rate = (Q * (cs[-1] / K - cfeed)
+                             + VhK * expn * cs[-1]) * inv_vSample
             dcdt[q_idx] = boundary_rate
             dcdt[qa_idx] = abs(boundary_rate)
             return dcdt
@@ -1106,7 +1193,7 @@ def make_ode_system(N, x, R, cD, beta, dt1, T0, Tfinal, RR, tEq,
             TC, dTdt_val = _temp(t)
             T = TC + 273.15
             inv_T = 1.0 / T
-            Q = _flow(t)
+            Q, expn = _flow(t, T, inv_T, dTdt_val)
 
             K = K0 * np.exp(EaK_Rgas * inv_T)
             dKdT_K = -EaK_Rgas * dTdt_val * inv_T * inv_T
@@ -1128,7 +1215,7 @@ def make_ode_system(N, x, R, cD, beta, dt1, T0, Tfinal, RR, tEq,
             base_bnd = base + 3 * n_int
             a = gam * Af_dx[-1] * D * inv_denomS
             vals[base_bnd] = a                                              # d/dc_{N-2}
-            vals[base_bnd + 1] = -a + (-Q / K + VhK * dKdT_K) * inv_denomS  # d/dc_{N-1}
+            vals[base_bnd + 1] = -a + (-Q / K + VhK * (dKdT_K - expn)) * inv_denomS  # d/dc_{N-1}
 
             base_src = base_bnd + 2
             if num_srcs > 0:
@@ -1141,9 +1228,10 @@ def make_ode_system(N, x, R, cD, beta, dt1, T0, Tfinal, RR, tEq,
                     blk[:N - 1] = k_src[si]
                     blk[N - 1] = w_last * k_src[si]
 
-            boundary_rate = Q * (c[N - 1] / K - _feed(t) * 0.001
-                                 / 22.414 * 273.15 * inv_T) * inv_vSample
-            derivative = Q / K * inv_vSample
+            boundary_rate = (Q * (c[N - 1] / K - _feed(t) * 0.001
+                                  / 22.414 * 273.15 * inv_T)
+                             + VhK * expn * c[N - 1]) * inv_vSample
+            derivative = (Q / K + VhK * expn) * inv_vSample
             vals[-4] = derivative               # d(q_net)/dc_R
             vals[-3] = 0.0                      # d(q_net)/dq_net
             vals[-2] = np.sign(boundary_rate) * derivative  # d(q_abs)/dc_R
@@ -1161,10 +1249,10 @@ def make_ode_system(N, x, R, cD, beta, dt1, T0, Tfinal, RR, tEq,
         Rm = R ** m_geom
 
         def rhs(t, c):
-            TC, _ = _temp(t)
+            TC, dTdt_val = _temp(t)
             T = TC + 273.15
             inv_T = 1.0 / T
-            Q = _flow(t)
+            Q, expn = _flow(t, T, inv_T, dTdt_val)
             cfeed = _feed(t) * 0.001 / 22.414 * 273.15 * inv_T
 
             K = K0 * np.exp(EaK_Rgas * inv_T)
@@ -1185,11 +1273,12 @@ def make_ode_system(N, x, R, cD, beta, dt1, T0, Tfinal, RR, tEq,
             dcdt[1:N - 1] = (Fl[:-1] - Fl[1:]) * invV[1:N - 1] + src_total
             dcdt[N - 1] = (Fl[-1] - Rm * qR) * invV[N - 1] + src_total
             dcdt[N] = (mp1 * 60.0 * F * (cR - c_gas * K) * inv_R_beta
-                       + Q * inv_Vhs * (cfeed - c_gas))
+                       + Q * inv_Vhs * (cfeed - c_gas) - expn * c_gas)
 
             if num_srcs > 0:
                 dcdt[src_off:src_off + num_srcs] = -rates
-            boundary_rate = Q * (c_gas - cfeed) * inv_vSample
+            boundary_rate = (Q * (c_gas - cfeed)
+                             + Vheadspace * expn * c_gas) * inv_vSample
             dcdt[q_idx] = boundary_rate
             dcdt[qa_idx] = abs(boundary_rate)
             return dcdt
@@ -1229,10 +1318,10 @@ def make_ode_system(N, x, R, cD, beta, dt1, T0, Tfinal, RR, tEq,
         invV_last = invV[N - 1]
 
         def jac(t, c):
-            TC, _ = _temp(t)
+            TC, dTdt_val = _temp(t)
             T = TC + 273.15
             inv_T = 1.0 / T
-            Q = _flow(t)
+            Q, expn = _flow(t, T, inv_T, dTdt_val)
             K = K0 * np.exp(EaK_Rgas * inv_T)
             D = D0 * np.exp(neg_EaD_Rgas * inv_T)
 
@@ -1253,7 +1342,7 @@ def make_ode_system(N, x, R, cD, beta, dt1, T0, Tfinal, RR, tEq,
             vals[b + 1] = -aD - Rm * F60 * invV_last            # dc_{N-1}/dc_{N-1}
             vals[b + 2] = Rm * F60 * K * invV_last              # dc_{N-1}/dc_gas
             vals[b + 3] = mp1 * F60 * inv_R_beta                # dc_gas/dc_{N-1}
-            vals[b + 4] = -mp1 * F60 * K * inv_R_beta - Q * inv_Vhs
+            vals[b + 4] = -mp1 * F60 * K * inv_R_beta - Q * inv_Vhs - expn
 
             b_src = b + 5
             if num_srcs > 0:
@@ -1264,8 +1353,9 @@ def make_ode_system(N, x, R, cD, beta, dt1, T0, Tfinal, RR, tEq,
                     vals[b_coup + si * N:b_coup + (si + 1) * N] = k_src[si]
 
             cfeed = _feed(t) * 0.001 / 22.414 * 273.15 * inv_T
-            boundary_rate = Q * (c[N] - cfeed) * inv_vSample
-            derivative = Q * inv_vSample
+            boundary_rate = (Q * (c[N] - cfeed)
+                             + Vheadspace * expn * c[N]) * inv_vSample
+            derivative = (Q + Vheadspace * expn) * inv_vSample
             vals[-4] = derivative               # d(q_net)/dc_gas
             vals[-3] = 0.0                      # d(q_net)/dq_net
             vals[-2] = np.sign(boundary_rate) * derivative  # d(q_abs)/dc_gas
@@ -1363,6 +1453,8 @@ def run_simulation(tfinal, temp_params, flow_params, cfeed_params,
     tEq = flow_params['tEq']
     tFlush = flow_params['tFlush']
     Q_val = flow_params['Q']
+    flow_basis = flow_params.get('basis', 'actual')
+    T_std = float(flow_params.get('T_std', 0.0))
     ns = int(cfeed_params['n_steps'])
     dl = cfeed_params['delta']
     st = cfeed_params['step_time']
@@ -1372,14 +1464,16 @@ def run_simulation(tfinal, temp_params, flow_params, cfeed_params,
     V_feed = cfeed_params.get('feed_tank_volume', 0.0)
 
     # The feed tank intentionally remains independent of the chamber flow
-    # schedule and is purged continuously at Q_val.
+    # schedule and is purged continuously at Q_val (the setpoint as entered
+    # for the standard flow basis).
     feed_tank_table = feed_tank_segments(
         tfinal, Q_val, V_feed, ns, dl, st, bc, hti, htf)
 
     rhs, solver_kw = make_ode_system(
         int(N), x, R, cD, beta, dt1, T0, Tfinal, RR, tEq, tFlush, Q_val,
         ns, dl, st, bc, hti, htf, src_params, Vheadspace, F, Rgas, D0, EaD,
-        K0, EaK, m, feed_tank_table=feed_tank_table)
+        K0, EaK, m, feed_tank_table=feed_tank_table,
+        flow_basis=flow_basis, T_std=T_std)
 
     tank_edges = feed_tank_table[0] if feed_tank_table is not None else None
     breaks = forcing_breakpoints(
@@ -1430,8 +1524,9 @@ def run_simulation(tfinal, temp_params, flow_params, cfeed_params,
     y = Y.T
     cR = y[:, int(N) - 1]
     T_C, _ = temperature_vec(t, dt1, T0, Tfinal, RR)
-    Q = flow_rate_vec(t, tEq, tFlush, Q_val)
+    Q_set = flow_rate_vec(t, tEq, tFlush, Q_val)
     T_K = T_C + 273.15
+    Q = chamber_flow_vec(t, T_K, flow_params)
     K = K0 * np.exp(-EaK / Rgas / T_K)
     S = K * (273.15 / T_K)
     DR = D0 * np.exp(-EaD / Rgas / T_K
@@ -1487,6 +1582,8 @@ def run_simulation(tfinal, temp_params, flow_params, cfeed_params,
         'c_feed_ppbv': c_feed_ppbv,
         'c_feed_uM': c_feed_uM,
         'Q': Q,
+        'Q_set': Q_set,
+        'flow_basis': flow_basis,
         'D': DR_cm2s,
         'S': S,
         'delta_mass': delta_mass_total,
@@ -2006,11 +2103,36 @@ class OutgassingGUI:
 
         flow = section(col0, "Flow Parameters")
         r = 0
+        # What the Flow Rate number means: actual flow at the chamber
+        # temperature (the original model) or an ambient MFC setpoint (sccm).
+        ttk.Label(flow, text="Flow basis:").grid(row=r, column=0, sticky=tk.W, pady=2)
+        self.flow_basis = ttk.Combobox(
+            flow, width=18, state="readonly",
+            values=[FLOW_BASIS_LABELS[b] for b in FLOW_BASES])
+        self.flow_basis.set(FLOW_BASIS_LABELS['actual'])
+        self.flow_basis.grid(row=r, column=1, sticky=tk.E, pady=2); r += 1
+        _Tooltip(self.flow_basis, FLOW_BASIS_TOOLTIP)
+        self.flow_basis_note = ttk.Label(
+            flow, text=FLOW_BASIS_NOTES['actual'], foreground='#555555',
+            font=('TkDefaultFont', 8), justify='left', wraplength=340)
+        self.flow_basis_note.grid(row=r, column=0, columnspan=2, sticky=tk.W,
+                                  pady=(0, 4)); r += 1
         self.tEq = self.create_entry(flow, "Initial time at Q = 0 (min):", "30", r); r += 1
-        self.Q = self.create_entry(flow, "Flow Rate (ml/min):", "20", r); r += 1
+        self.Q_label = ttk.Label(flow, text="Flow Rate (ml/min):")
+        self.Q_label.grid(row=r, column=0, sticky=tk.W, pady=2)
+        self.Q = ttk.Entry(flow, width=12)
+        self.Q.insert(0, "20")
+        self.Q.grid(row=r, column=1, sticky=tk.E, pady=2); r += 1
+        self.flow_T_std_label = ttk.Label(flow, text="sccm reference T, T_std (°C):")
+        self.flow_T_std_label.grid(row=r, column=0, sticky=tk.W, pady=2)
+        self.flow_T_std = ttk.Entry(flow, width=12)
+        self.flow_T_std.insert(0, "0")
+        self.flow_T_std.grid(row=r, column=1, sticky=tk.E, pady=2); r += 1
+        self.flow_basis.bind('<<ComboboxSelected>>', self._on_flow_basis_change)
         self.tau_vessel_var = tk.StringVar(value="—")
         self.create_readout(flow, "Vessel gas residence time, τ_v (min):",
                             r, self.tau_vessel_var); r += 1
+        self._on_flow_basis_change()
 
         feed = section(col1, "Feed Concentration Profile")
         r = 0
@@ -2301,6 +2423,36 @@ class OutgassingGUI:
         self.sweep_param_combo.config(state='readonly' if enabled else 'disabled')
         self.sweep_log_check.config(state=state)
 
+    def _flow_basis_key(self):
+        """'actual' or 'standard' from the Flow basis selector."""
+        label = self.flow_basis.get()
+        for key, text in FLOW_BASIS_LABELS.items():
+            if text == label:
+                return key
+        return 'actual'
+
+    def _on_flow_basis_change(self, event=None):
+        """Show the note, flow unit and T_std row for the selected basis."""
+        basis = self._flow_basis_key()
+        self.flow_basis_note.config(text=FLOW_BASIS_NOTES[basis])
+        if basis == 'standard':
+            self.Q_label.config(text="Flow Rate (sccm):")
+            self.flow_T_std_label.grid()
+            self.flow_T_std.grid()
+        else:
+            self.Q_label.config(text="Flow Rate (ml/min):")
+            self.flow_T_std_label.grid_remove()
+            self.flow_T_std.grid_remove()
+        if event is not None:
+            self._update_derived()
+
+    def _chamber_flow_at(self, T_C):
+        """Chamber flow (ml/min) at T_C from the live Flow inputs."""
+        Q = float(self.Q.get())
+        if self._flow_basis_key() == 'standard':
+            Q *= (T_C + 273.15) / (float(self.flow_T_std.get()) + 273.15)
+        return Q
+
     def create_entry(self, parent, label, default, row):
         ttk.Label(parent, text=label).grid(row=row, column=0, sticky=tk.W, pady=2)
         entry = ttk.Entry(parent, width=12)
@@ -2323,7 +2475,8 @@ class OutgassingGUI:
         for w in (self.feed_tank_volume, self.Q, self.n_steps, self.delta,
                   self.step_time, self.hold_time_initial, self.hold_time_final,
                   self.Vvessel, self.mSample, self.rhoSample, self.R, self.D_ref,
-                  self.MW_analyte, self.c0free, self.K_ref, self.Tref, self.F):
+                  self.MW_analyte, self.c0free, self.K_ref, self.Tref, self.F,
+                  self.flow_T_std, self.T0, self.Tfinal):
             w.bind("<KeyRelease>", self._update_derived, add="+")
             w.bind("<FocusOut>", self._update_derived, add="+")
 
@@ -2367,7 +2520,9 @@ class OutgassingGUI:
         except (ValueError, tk.TclError):
             self.feed_cycle_var.set("—")
 
-        # Vessel gas (headspace) residence time, tau_v = V_headspace / Q  (min)
+        # Vessel gas (headspace) residence time, tau_v = V_headspace / Q  (min).
+        # With a standard (sccm) flow the chamber flow follows T, so tau_v is
+        # shown at the initial and final temperatures.
         try:
             Q = _f(self.Q)
             vSample = _f(self.mSample) * 1e-3 / _f(self.rhoSample)   # mg, g/ml -> ml
@@ -2376,6 +2531,13 @@ class OutgassingGUI:
                 self.tau_vessel_var.set("— (no headspace)")
             elif Q <= 0:
                 self.tau_vessel_var.set("∞ (Q = 0)")
+            elif self._flow_basis_key() == 'standard':
+                T0, T1 = _f(self.T0), _f(self.Tfinal)
+                tau0 = Vhead / self._chamber_flow_at(T0)
+                tau1 = Vhead / self._chamber_flow_at(T1)
+                self.tau_vessel_var.set(
+                    f"{tau0:.4g}" if np.isclose(T0, T1)
+                    else f"{tau0:.3g} → {tau1:.3g}")
             else:
                 self.tau_vessel_var.set(f"{Vhead / Q:.4g}")
         except (ValueError, ZeroDivisionError, tk.TclError):
@@ -2410,11 +2572,12 @@ class OutgassingGUI:
 
         # Purge Péclet number, Pe = Q·R²/(V_head·D) = τ_D / τ_v (dimensionless,
         # at Tref, c = 0).  Headspace flush rate Q/V_head [1/min] over the
-        # diffusive release rate D/R² [1/min].
+        # diffusive release rate D/R² [1/min].  Q is the chamber flow at Tref.
         try:
             R_cm = _f(self.R) * 1e-4              # µm -> cm
             D = _f(self.D_ref)                   # cm^2/s
-            Q = _f(self.Q)                       # ml/min
+            Q = (self._chamber_flow_at(_f(self.Tref))    # ml/min
+                 if self._flow_basis_key() == 'standard' else _f(self.Q))
             vSample = _f(self.mSample) * 1e-3 / _f(self.rhoSample)   # mg, g/ml -> ml
             Vhead = _f(self.Vvessel) - vSample
             if R_cm <= 0 or D <= 0:
@@ -2831,6 +2994,8 @@ class OutgassingGUI:
             'dt1': self.dt1.get(), 'T0': self.T0.get(),
             'Tfinal': self.Tfinal.get(), 'RR': self.RR.get(),
             'tEq': self.tEq.get(), 'Q': self.Q.get(),
+            'flow_basis': self._flow_basis_key(),
+            'flow_T_std': self.flow_T_std.get(),
             'n_steps': self.n_steps.get(), 'delta': self.delta.get(),
             'step_time': self.step_time.get(), 'base_conc': self.base_conc.get(),
             'hold_time_initial': self.hold_time_initial.get(),
@@ -2907,6 +3072,18 @@ class OutgassingGUI:
         # Older files are normalized by the fallbacks/migrations below and are
         # written back using the current schema on the next save.
         d['schema_version'] = CONFIG_SCHEMA_VERSION
+        # Schema 3/4 files from the development GUI may describe a hollow
+        # structure, which this solid-sample solver cannot run.
+        structure = str(d.get('structure_mode', 'Solid sample'))
+        if structure != 'Solid sample':
+            raise ValueError(
+                f'This file describes a {structure.lower()}, which needs the '
+                'Geometry Update GUI; this version models solid samples only.')
+        if schema_version < 4:
+            # Before schema 4 the flow rate was always the actual flow at the
+            # chamber temperature.
+            d.setdefault('flow_basis', 'actual')
+            d.setdefault('flow_T_std', '0')
 
         # A blank string is not a value.  The GUI serializes raw Entry contents,
         # so any field the user never filled in -- and every field belonging to a
@@ -3085,6 +3262,23 @@ class OutgassingGUI:
                 'Tfinal': f('Tfinal', '250'), 'RR': f('RR', '5')}
         tfinal = f('tfinal', '150')
         flow = {'tEq': f('tEq', '30'), 'tFlush': tfinal, 'Q': f('Q', '20')}
+        flow_basis = str(val('flow_basis', 'actual'))
+        if flow_basis not in FLOW_BASES:
+            raise ValueError(
+                f"flow_basis must be one of {', '.join(FLOW_BASES)} "
+                f"(got {flow_basis!r}).")
+        flow['basis'] = flow_basis
+        if flow_basis == 'standard':
+            flow['T_std'] = f('flow_T_std', '0')
+        else:
+            # Unused for the actual basis, so it must never block a load.
+            try:
+                T_std_ok = f('flow_T_std', '0') > -273.15
+            except ValueError:
+                T_std_ok = False
+            if not T_std_ok:
+                d['flow_T_std'] = '0'
+                repairs.append('flow_T_std was not a usable temperature; using 0')
         feed = {'n_steps': as_int('n_steps', '0'),
                 'delta': f('delta', '1000'),
                 'step_time': f('step_time', '240'),
@@ -3233,10 +3427,14 @@ class OutgassingGUI:
             'feed_tank_volume':'0','R':'200','mSample':'50','rhoSample':'1',
             'Vvessel':'10','MW_analyte':'18','K_ref':'150','EaK':'-35',
             'D_ref':'1e-7','EaD':'15','Tref':'50','cD':'inf','F':'inf',
-            'c0free':'10','cgas_init':'0',
+            'c0free':'10','cgas_init':'0','flow_T_std':'0',
         }
         for key, fallback in entry_defaults.items():
             self._set_entry_value(getattr(self, key), d.get(key, fallback))
+
+        basis = d.get('flow_basis', 'actual')
+        self.flow_basis.set(FLOW_BASIS_LABELS.get(basis, FLOW_BASIS_LABELS['actual']))
+        self._on_flow_basis_change()
 
         gs = d.get('grid_scheme', 'uniform')
         self.grid_scheme.set(gs if gs in GRID_SCHEMES else 'uniform')
@@ -3890,7 +4088,16 @@ class OutgassingGUI:
             'Final Temp (C)': p['Tfinal'],
             'Ramp Rate (C/min)': p['RR'],
             'Initial time at Q=0 (min)': p['tEq'],
-            'Flow Rate (ml/min)': p['Q'],
+        }
+        flow_basis = p.get('flow_basis', 'actual')
+        params['Flow basis'] = FLOW_BASIS_LABELS[flow_basis]
+        if flow_basis == 'standard':
+            params['Flow Rate (sccm)'] = p['Q']
+            params['sccm reference T (C)'] = p.get('flow_T_std', 0.0)
+            params['Chamber flow'] = 'Q*T/T_std at 1 atm, plus thermal-expansion outflow while Q > 0'
+        else:
+            params['Flow Rate (ml/min)'] = p['Q']
+        params.update({
             'Feed n_steps': p['n_steps'],
             'Feed delta (ppbv)': p['delta'],
             'Feed step_time (min)': p['step_time'],
@@ -3931,7 +4138,7 @@ class OutgassingGUI:
             'Log concentration at run': p.get('log_concentration', False),
             'Time-axis minimum at run': p.get('time_min'),
             'Time-axis maximum at run': p.get('time_max'),
-        }
+        })
         src = np.asarray(p.get('src_params', []), dtype=float)
         for i in range(src.size // 3):
             params[f'Source_{i+1}_c0 (uM)'] = src[3 * i]
@@ -3952,6 +4159,14 @@ class OutgassingGUI:
             return f'{float(value):.10g}'
 
         Q = float(p['Q'])
+        standard_flow = p.get('flow_basis', 'actual') == 'standard'
+
+        def chamber_flow(T_C):
+            """Chamber flow (ml/min) at T_C for the run's flow basis."""
+            if not standard_flow:
+                return Q
+            return Q * (float(T_C) + 273.15) / (float(p.get('flow_T_std', 0.0)) + 273.15)
+
         feed_volume = float(p['feed_tank_volume'])
         tau_feed = (0.0 if feed_volume <= 0 else
                     (np.inf if Q <= 0 else feed_volume / Q))
@@ -3961,12 +4176,17 @@ class OutgassingGUI:
                       + float(p['hold_time_final']))
         sample_volume = float(p['mSample']) * 1e-3 / float(p['rhoSample'])
         headspace = float(p['Vvessel']) - sample_volume
+        # tau_v at T0 (the flow through the chamber varies with T for a
+        # standard flow; the value at Tfinal is reported separately).
         tau_vessel = (None if headspace <= 0 else
-                      (np.inf if Q <= 0 else headspace / Q))
+                      (np.inf if Q <= 0 else headspace / chamber_flow(p['T0'])))
+        tau_vessel_final = (None if headspace <= 0 else
+                            (np.inf if Q <= 0 else headspace / chamber_flow(p['Tfinal'])))
         tau_diff = ((float(p['R']) ** 2 / float(p['D_ref'])) / 60.0
                     if p['R'] > 0 and p['D_ref'] > 0 else None)
         # Mass-transfer Biot number Bi = F*R/D and purge Peclet number
-        # Pe = Q*R^2/(V_head*D) = tau_diff/tau_vessel, both at Tref and c = 0.
+        # Pe = Q*R^2/(V_head*D) = tau_diff/tau_vessel, both at Tref and c = 0
+        # (Q is the chamber flow at Tref).
         # p['R'] is already in cm, D_ref in cm^2/s and F in cm/s.
         biot = None
         if p['R'] > 0 and p['D_ref'] > 0 and p['F'] >= 0:
@@ -3974,7 +4194,7 @@ class OutgassingGUI:
                     else float(p['F']) * float(p['R']) / float(p['D_ref']))
         peclet = None
         if tau_diff is not None and headspace > 0:
-            peclet = 0.0 if Q <= 0 else tau_diff * Q / headspace
+            peclet = 0.0 if Q <= 0 else tau_diff * chamber_flow(p['Tref']) / headspace
         beta = headspace / sample_volume if sample_volume > 0 and headspace > 0 else None
         c_eq = (float(p['c0free']) / (float(p['K_ref']) + beta)
                 if beta is not None and float(p['K_ref']) + beta > 0 else None)
@@ -3989,6 +4209,14 @@ class OutgassingGUI:
             'Repeating feed-cycle period (min)': (
                 'constant' if constant_feed else fmt(feed_cycle)),
             'Vessel gas residence time, tau_v (min)': fmt(tau_vessel),
+        }
+        if standard_flow:
+            constants['Vessel gas residence time, tau_v (min)'] = (
+                f'{fmt(tau_vessel)} at T0')
+            constants['Vessel gas residence time at Tfinal (min)'] = fmt(tau_vessel_final)
+            constants['Chamber flow at T0 (ml/min)'] = fmt(chamber_flow(p['T0']))
+            constants['Chamber flow at Tfinal (ml/min)'] = fmt(chamber_flow(p['Tfinal']))
+        constants.update({
             'Headspace volume (ml)': fmt(headspace),
             'Sample volume (ml)': fmt(sample_volume),
             'Characteristic diffusion time, R^2/D (min)': fmt(tau_diff),
@@ -3998,7 +4226,7 @@ class OutgassingGUI:
             f'No-flow equilibrium concentration ({noflow_unit})': fmt(noflow),
             'Initial mobile, mass basis': self._mass_fraction_str(
                 p['c0free'], p['MW_analyte'], p['rhoSample']),
-        }
+        })
         src = np.asarray(p.get('src_params', []), dtype=float)
         for i in range(src.size // 3):
             constants[f'Source_{i+1}_c0, mass basis'] = self._mass_fraction_str(
@@ -4035,7 +4263,12 @@ class OutgassingGUI:
             cols['c_feed (ug/m3)'] = cf_uM * MW * 1000.0
             cols['c_feed (mg/m3)'] = cf_uM * MW
         cols.update({
+            # Actual flow through the chamber at its temperature (both bases).
             'Q (ml/min)':            results['Q'],
+        })
+        if results.get('flow_basis', 'actual') == 'standard':
+            cols['Q setpoint (sccm)'] = results['Q_set']
+        cols.update({
             'D (cm^2/s)':            results['D'],
             'S (cm^3@STP/atm/cm^3)': results['S'],
             'delta_m (ng)':          results['delta_mass'],
@@ -4111,7 +4344,7 @@ class OutgassingGUI:
             ('temperature', 'T_C', 'Temperature, $T$ (°C)', False, None),
             ('feed_conc', 'c_feed_ppbv',
              self._feed_axis_label(plot_unit, export=True), False, None),
-            ('flow_rate', 'Q', 'Flow rate, $Q$ (mL min$^{-1}$)', False, None),
+            ('flow_rate', 'Q', 'Chamber flow, $Q$ (mL min$^{-1}$)', False, None),
             ('diffusivity', 'D', 'Diffusivity, $D$ (cm$^2$ s$^{-1}$)', True, None),
             ('solubility', 'S',
              'Solubility, $S$ (cm$^3$(STP) cm$^{-3}$ atm$^{-1}$)', False, None),
@@ -4487,6 +4720,9 @@ class OutgassingGUI:
             tEq=finite(self.tEq, 'Initial zero-flow time'),
             tFlush=tfinal,
             Q=finite(self.Q, 'Flow rate'),
+            flow_basis=self._flow_basis_key(),
+            flow_T_std=(finite(self.flow_T_std, 'sccm reference temperature')
+                        if self._flow_basis_key() == 'standard' else 0.0),
             n_steps=integer(self.n_steps, 'Feed steps'),
             delta=finite(self.delta, 'Feed increment'),
             step_time=finite(self.step_time, 'Feed step time'),
@@ -4525,7 +4761,7 @@ class OutgassingGUI:
         )
         temp = {'dt1': p['dt1'], 'T0': p['T0'],
                 'Tfinal': p['Tfinal'], 'RR': p['RR']}
-        flow = {'tEq': p['tEq'], 'tFlush': p['tFlush'], 'Q': p['Q']}
+        flow = self._flow_params(p)
         feed = {key: p[key] for key in (
             'n_steps', 'delta', 'step_time', 'base_conc',
             'hold_time_initial', 'hold_time_final', 'feed_tank_volume')}
@@ -4537,11 +4773,18 @@ class OutgassingGUI:
             p['Tref'], p['grid_scheme'], p['grid_stretch'])
         return p
 
+    @staticmethod
+    def _flow_params(p):
+        """Flow inputs for run_simulation from a parameter snapshot."""
+        return {'tEq': p['tEq'], 'tFlush': p['tFlush'], 'Q': p['Q'],
+                'basis': p.get('flow_basis', 'actual'),
+                'T_std': p.get('flow_T_std', 0.0)}
+
     def _run_one(self, p, output_times=None):
         """Run a single simulation from a parameter dict p; return results dict."""
         temp_params = {'dt1': p['dt1'], 'T0': p['T0'],
                        'Tfinal': p['Tfinal'], 'RR': p['RR']}
-        flow_params = {'tEq': p['tEq'], 'tFlush': p['tFlush'], 'Q': p['Q']}
+        flow_params = self._flow_params(p)
         cfeed_params = {
             'n_steps': p['n_steps'], 'delta': p['delta'],
             'step_time': p['step_time'], 'base_conc': p['base_conc'],
@@ -6055,7 +6298,7 @@ class OutgassingGUI:
             (self.ax1, 'Time (min)', 'Temperature (°C)', 'Temperature'),
             (self.ax2, 'Time (min)', self._feed_axis_label(plot_unit),
              'Feed Concentration'),
-            (self.ax3, 'Time (min)', 'Flow Rate (ml/min)', 'Flow Rate'),
+            (self.ax3, 'Time (min)', 'Chamber Flow (ml/min)', 'Chamber Flow'),
             (self.ax4, 'Time (min)', 'Diffusivity (cm²/s)',
              'Diffusivity at Surface'),
             (self.ax5, 'Time (min)', 'S (cm³@STP/atm/cm³)', 'Solubility'),

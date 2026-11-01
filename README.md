@@ -89,7 +89,7 @@ The left-side controls are grouped by purpose. Most values are plain numeric fie
 | --- | --- |
 | `Simulation Parameters` | Final time, grid points, relative tolerance, absolute tolerance, accuracy check, grid scheme, and grid stretch. `N` must be at least 3. |
 | `Temperature Profile` | Initial hold time, initial temperature, final temperature, and ramp rate. If initial and final temperatures differ, ramp rate must be positive. |
-| `Flow Parameters` | Initial no-flow time and carrier-gas flow rate. The GUI also computes vessel gas residence time from headspace volume and flow. |
+| `Flow Parameters` | Flow basis (actual flow at chamber temperature, or standard flow from a mass-flow controller in sccm), initial no-flow time, carrier-gas flow rate and, for sccm, its reference temperature. The GUI also computes vessel gas residence time from headspace volume and flow. |
 | `Feed Concentration Profile` | Number of feed steps, concentration increment per step, step duration, base concentration, initial/final holds, and optional feed-tank volume. |
 | `Sample Properties` | Geometry, sample radius or half-thickness, sample mass, density, vessel volume, and analyte molecular weight. |
 | `Transport Properties` | Reference temperature, partition coefficient, signed sorption enthalpy, diffusivity, diffusivity activation energy, plasticization power, surface transfer coefficient, initial mobile concentration, and initial gas concentration. |
@@ -139,8 +139,10 @@ The tables below define the editable GUI fields. Units are the GUI input units, 
 
 | GUI label | Symbol | Meaning |
 | --- | --- | --- |
+| `Flow basis` | `flow_basis` | What the flow rate means; see [Carrier-flow basis](#carrier-flow-basis). `Actual @ chamber T` (the default, and the behavior of earlier versions) or `Standard (sccm)` for a mass-flow-controller setpoint. A short note under the selector states what the choice implies. |
 | `Initial time at Q = 0 (min)` | `tEq` | Initial no-flow or equilibration period. During this time the carrier flow is zero. |
-| `Flow Rate (ml/min)` | `Q` | Volumetric carrier-gas flow rate after the initial no-flow period. This drives removal from the well-mixed headspace through the term `Q(c_feed - c_gas)/V_headspace`. The model treats `Q` as the volumetric flow at the chamber temperature, and converts the feed's ppbv to a molar concentration at that temperature. |
+| `Flow Rate (ml/min)` or `Flow Rate (sccm)` | `Q` | Carrier-gas flow rate after the initial no-flow period. The flow through the chamber drives removal from the well-mixed headspace through the term `Q_ch(c_feed - c_gas)/V_headspace`, with the feed's ppbv converted to a molar concentration at the chamber temperature. For the actual basis `Q_ch = Q`; for the standard basis `Q_ch = Q*T/T_std`. |
+| `sccm reference T, T_std (C)` | `flow_T_std` | Standard temperature of the mass-flow controller's sccm (0 C by default; makers also use 20, 21.1 or 25 C). Shown only for the standard basis. |
 
 #### Feed Concentration Profile
 
@@ -242,6 +244,15 @@ The status line reports two quality measures:
 - **Mass-balance residual**: compares the analyte that left through the purge with the change in inventory. It is a bookkeeping check, not an accuracy measure. BDF conserves this balance exactly for finite `F` and for isothermal runs however inaccurate the solution, so a small residual proves nothing; it can only grow during temperature ramps with `F = inf`. A high residual still means the tolerances are too loose.
 
 During fitting, runs with a high mass-balance residual are rejected, and the accuracy check is applied to the best fit.
+
+### Carrier-flow basis
+
+A gas flow in ml/min needs a temperature to mean anything, so the `Flow basis` selector says which one the `Flow Rate` uses. Both choices assume the chamber is at 1 atm.
+
+- `Actual @ chamber T` (default): `Q` is the volumetric flow at the chamber's current temperature. When the chamber is heated at a fixed `Q`, fewer moles of carrier pass per minute (molar flow proportional to `1/T`). This matches a flow measured at chamber conditions and reproduces earlier versions exactly. If `Q` was really set or measured at room temperature, the purge is underestimated by about 30 % at 150 C and 43 % at 250 C, and a purge-dominated headspace concentration is overpredicted by the same factor.
+- `Standard (sccm)`: `Q` is a mass-flow-controller setpoint referenced to `T_std` and 1 atm. The molar carrier flow is fixed whatever the chamber does, so the flow through the chamber is `Q_ch = Q*T/T_std`. While the flow is on, heating also expels headspace gas as it expands, which removes analyte at the fractional rate `(dT/dt)/T` (cooling draws gas back in). During the initial `Q = 0` period the vessel is treated as sealed. The feed tank's residence time uses the setpoint as entered (`Feed Tank Volume / Flow Rate`), which treats the tank as being at `T_std`.
+
+With the standard basis, the vessel residence time readout shows its values at `T0` and `Tfinal`, and the Péclet number uses the chamber flow at `Tref`. The plotted and exported `Q (ml/min)` is always the actual flow through the chamber; the standard basis adds a `Q setpoint (sccm)` column. Sweeps and fits of `Q` vary the number as entered, so with the standard basis the sweep label's `ml/min` should be read as sccm. Parameter files store the choice as `flow_basis` and `flow_T_std` (schema 4); files from earlier versions load with the actual basis. The notebook implements the actual basis only.
 
 ### Temperature, Flow, And Feed Profiles
 
@@ -406,7 +417,7 @@ The model supports:
 - Diffusivity: Arrhenius temperature dependence with optional concentration dependence through finite `cD`.
 - Surface boundary conditions: instantaneous equilibrium (`F = inf`) or finite surface mass transfer (`F` in cm/s).
 - Temperature profiles: initial hold followed by heating or cooling to a target temperature.
-- Flow profiles: alternating no-flow/equilibration and flushing periods.
+- Flow profiles: alternating no-flow/equilibration and flushing periods, with the flow given as actual flow at chamber temperature or as a standard (sccm) mass-flow-controller setpoint (GUI).
 - Feed concentration profiles: stepped rise/fall profiles with optional finite feed-tank roll-over in the GUI.
 - Chemical sources: any number of first-order Arrhenius source terms in the model; the GUI exposes up to 20 source rows.
 - Outputs: temperature, feed concentration, flow, surface diffusivity, solubility, sample mass change, headspace gas concentration, solve time, and mass-balance error.
