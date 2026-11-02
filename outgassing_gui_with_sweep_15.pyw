@@ -845,7 +845,10 @@ def solve_forced_ivp(rhs, tfinal, y0, breaks, rtol, atol,
     Returns (t, Y, stats).  `t` is strictly increasing; `Y` has shape
     (n_states, len(t)); `stats` carries nfev/njev/nlu, n_segments and seg_edges
     (the index of each breakpoint in `t`, so a discontinuous integrand can be
-    integrated segment by segment rather than straddling a jump).
+    integrated segment by segment rather than straddling a jump).  Each
+    interior breakpoint b appears twice: at b itself and at the left limit
+    nextafter(b, -inf), so forcing evaluated on `t` steps at b instead of
+    ramping from the segment's last accepted step.
 
     `output_times` are added to the solver's own output grid (evaluated from
     the dense output), so two runs can be compared at identical instants.
@@ -913,6 +916,12 @@ def solve_forced_ivp(rhs, tfinal, y0, breaks, rtol, atol,
             ts = np.unique(np.concatenate(
                 (ts, np.linspace(a, b, min_out_per_segment))))
         ts[0], ts[-1] = a, b
+        # End the segment at the left limit of b; the next segment supplies b.
+        # The states are continuous there, but the flow and feed jump, and
+        # without this point they would be drawn and exported as a ramp from
+        # the last accepted step (possibly minutes before b) to the new value.
+        if b < breaks[-1]:
+            ts[-1] = b_left
         if extra_times is not None:
             inside = extra_times[(extra_times > a) & (extra_times < b)]
             if inside.size:
